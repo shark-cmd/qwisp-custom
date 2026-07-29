@@ -1,0 +1,19 @@
+# Swift
+/.build/
+/Packages/
+/*.xcodeproj/
+xcuserdata/
+DerivedData/
+.swiftpm/
+
+# OS
+.DS_Store
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
