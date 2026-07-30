@@ -328,15 +328,15 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 let windowHeadroom = Tell.envInt("QWISP_WINDOW_HEADROOM", 4096)  // tokens to keep after shift
 
                 while produced < ceiling && !cancel.isCancelled {
-                    // Sliding window: if enabled and non-bolt path, compact when seq approaches limit
-                    if slidingWindow > 0 && !boltActive && seq.count >= slidingWindow - windowHeadroom {
+                    // Sliding window: if enabled, compact when seq approaches limit
+                    if slidingWindow > 0 && seq.count >= slidingWindow - windowHeadroom {
                         let dropTokens = seq.count - slidingWindow + windowHeadroom
                         if dropTokens > 0 {
                             FileHandle.standardError.write(Data(
                                 "[qwisp] context compacting: dropping \(dropTokens) oldest tokens (context: \(seq.count)/\(slidingWindow))\n".utf8))
                             seq = Array(seq.dropFirst(dropTokens))
-                            // Shift all KV cache layers in the persistent prefix backend
-                            if let queue = SeedlessMetalForward.getQueue() {
+                            // Shift all KV cache layers in the persistent prefix backend (non-bolt)
+                            if !boltActive, let queue = SeedlessMetalForward.getQueue() {
                                 for kv in (self.prefixBackend?.kvCaches ?? []) {
                                     SeedlessMetalForward.shiftKVCache(kv: kv, drop: dropTokens, queue: queue)
                                 }
@@ -640,8 +640,36 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 let maxK = cfg.isStreaming
                     ? Swift.max(4, DeviceCalibration.strictStreamingC(tierC: cfg.c) * 3 / 8)
                     : cfg.maxK
-                _ = Tell.runSpecLoop(promptIds: full, backend: backend, engine: self.engine,
-                                     N: genBudget, maxK: maxK, prefillTokens: genSuffix,
+                // Sliding window: if prompt exceeds the window, drop oldest tokens + shift KV cache.
+                // This runs after the arena is built and content is prefilled, so the KV buffers
+                // hold positions [0..contentLen). We trim both the token sequence and the KV state.
+                let slidingWindow = Tell.envInt("QWISP_SLIDING_WINDOW", 0)
+                let windowHeadroom = Tell.envInt("QWISP_WINDOW_HEADROOM", 4096)
+                var effectiveFull = full
+                var effectiveGenSuffix = genSuffix
+                if slidingWindow > 0 && full.count >= slidingWindow - windowHeadroom {
+                    let dropTokens = full.count - slidingWindow + windowHeadroom
+                    if dropTokens > 0 {
+                        FileHandle.standardError.write(Data(
+                            "[qwisp] context compacting: dropping \(dropTokens) oldest tokens (context: \(full.count)/\(slidingWindow))\n".utf8))
+                        effectiveFull = Array(full.dropFirst(dropTokens))
+                        effectiveGenSuffix = Array(effectiveFull[Swift.min(Swift.max(contentLen - dropTokens, 0), effectiveFull.count)...])
+                        // Shift KV cache for all layers
+                        if let queue = SeedlessMetalForward.getQueue() {
+                            for kv in (backend.kvCaches ?? []) {
+                                SeedlessMetalForward.shiftKVCache(kv: kv, drop: dropTokens, queue: queue)
+                            }
+                        }
+                        // Invalidate prefix snapshots — positions are now stale
+                        self.prefixSlots = []
+                        self.arenaContent = []
+                    }
+                }
+
+                // Prefill the generation-prompt suffix + decode. prefillTokens = suffix (arena already
+                // holds content); hist = the full prompt so SuffixSpec drafting is unchanged.
+                _ = Tell.runSpecLoop(promptIds: effectiveFull, backend: backend, engine: self.engine,
+                                     N: genBudget, maxK: maxK, prefillTokens: effectiveGenSuffix,
                                      isCancelled: { cancel.isCancelled },
                                      onToken: { continuation.yield($0) })
                 continuation.finish()
