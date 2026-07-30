@@ -917,6 +917,7 @@ public enum SeedlessMetalForward {
     nonisolated(unsafe) static var _finalCombinePipeline: MTLComputePipelineState? // all-GPU MoE: y+gateScale*sharedY
     nonisolated(unsafe) static var _shiftConvPipeline: MTLComputePipelineState?    // GDN decode: conv cache shift
     nonisolated(unsafe) static var _writeKVPipeline: MTLComputePipelineState?      // attn decode: KV cache 散布
+    nonisolated(unsafe) static var _shiftKVPipeline: MTLComputePipelineState?       // context compacting: KV cache shift
     nonisolated(unsafe) static var _gqmmSwigluPipeline: MTLComputePipelineState?   // MoE: gate+up gather+swiglu 融合
     nonisolated(unsafe) static var _ropeRowsPipeline: MTLComputePipelineState?     // D1-6: M-row RoPE
     nonisolated(unsafe) static var _conv1dSiluRowsPipeline: MTLComputePipelineState?  // D1-4: M-row conv1d+silu
@@ -1069,6 +1070,19 @@ public enum SeedlessMetalForward {
             uint h = i / D, d = i % D;
             cache[h * maxLen * D + pos * D + d] = src[h * D + d];
         }
+        // shift_kv（context compacting）: cache[KV, maxLen, D] の [drop..len] を [0..len-drop] にシフト。
+        //   sliding window context compacting で最古の drop トークンを破棄し、残りを先頭に詰める。
+        kernel void shift_kv(device half* cache [[buffer(0)]], constant uint& KV [[buffer(1)]],
+                             constant uint& D [[buffer(2)]], constant uint& maxLen [[buffer(3)]],
+                             constant uint& drop [[buffer(4)]], constant uint& len [[buffer(5)]],
+                             uint i [[thread_position_in_grid]]) {
+            if (i >= KV * D) return;
+            uint h = i / D, d = i % D;
+            uint newLen = len - drop;
+            for (uint t = 0; t < newLen; t++) {
+                cache[h * maxLen * D + t * D + d] = cache[h * maxLen * D + (t + drop) * D + d];
+            }
+        }
         """
         do {
             let lib = try device.makeLibrary(source: src, options: mlxMatchCompileOpts())
@@ -1086,6 +1100,7 @@ public enum SeedlessMetalForward {
             _finalCombinePipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "final_combine")!)
             _shiftConvPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "shift_conv")!)
             _writeKVPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "write_kv")!)
+            _shiftKVPipeline = try device.makeComputePipelineState(function: lib.makeFunction(name: "shift_kv")!)
             return true
         } catch { print("[raw-aux] compile: \(error)"); return false }
     }
@@ -2845,6 +2860,42 @@ public enum SeedlessMetalForward {
                           seRel, seRel == 0 ? "✅ bit-exact" : (seRel < 2e-3 ? "△ near" : "❌"), seMs, rtMs, rtMs/Swift.max(0.001, seMs))
         } else { out += "\n  attn SE: prepare/実行 失敗" }
         return out
+    }
+
+    /// Shift KV cache left by drop tokens (sliding window context compacting)
+    public static func shiftKVCache(kv: SeedlessFusedVerify.KVCacheBufs, drop: Int, queue: MTLCommandQueue) {
+        guard drop > 0, kv.len > drop, let pipeline = _shiftKVPipeline else { return }
+        guard let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pipeline)
+        enc.setBuffer(kv.kCache, offset: 0, index: 0)
+        var kvNum = UInt32(kv.KV), d = UInt32(kv.D), ml = UInt32(kv.maxLen), dr = UInt32(drop), ln = UInt32(kv.len)
+        enc.setBytes(&kvNum, length: 4, index: 1)
+        enc.setBytes(&d, length: 4, index: 2)
+        enc.setBytes(&ml, length: 4, index: 3)
+        enc.setBytes(&dr, length: 4, index: 4)
+        enc.setBytes(&ln, length: 4, index: 5)
+        enc.dispatchThreads(MTLSize(width: kv.KV * kv.D, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(pipeline.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        enc.endEncoding()
+        // Now shift vCache
+        guard let enc2 = cb.makeComputeCommandEncoder() else { return }
+        enc2.setComputePipelineState(pipeline)
+        enc2.setBuffer(kv.vCache, offset: 0, index: 0)
+        enc2.setBytes(&kvNum, length: 4, index: 1)
+        enc2.setBytes(&d, length: 4, index: 2)
+        enc2.setBytes(&ml, length: 4, index: 3)
+        enc2.setBytes(&dr, length: 4, index: 4)
+        enc2.setBytes(&ln, length: 4, index: 5)
+        enc2.dispatchThreads(MTLSize(width: kv.KV * kv.D, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(pipeline.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1))
+        enc2.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        kv.len -= drop
+    }
+    
+    /// Get the Metal command queue for KV cache operations
+    public static func getQueue() -> MTLCommandQueue? {
+        guard let (_, queue) = ensure() else { return nil }
+        return queue
     }
 
     /// MoE expert 計算の常駐 buffer（重み＋中間＝一度だけ確保）。routing(inds)/combine は外部(MLX)。

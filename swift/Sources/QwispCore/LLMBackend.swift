@@ -323,7 +323,30 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     seq = promptIds0 + g.gen.map { Int32($0) }
                     produced = g.gen.count
                 }
+                // Sliding window context compacting: when context approaches limit, shift KV cache
+                let slidingWindow = Tell.envInt("QWISP_SLIDING_WINDOW", 0)  // 0 = disabled
+                let windowHeadroom = Tell.envInt("QWISP_WINDOW_HEADROOM", 4096)  // tokens to keep after shift
+
                 while produced < ceiling && !cancel.isCancelled {
+                    // Sliding window: if enabled and non-bolt path, compact when seq approaches limit
+                    if slidingWindow > 0 && !boltActive && seq.count >= slidingWindow - windowHeadroom {
+                        let dropTokens = seq.count - slidingWindow + windowHeadroom
+                        if dropTokens > 0 {
+                            FileHandle.standardError.write(Data(
+                                "[qwisp] context compacting: dropping \(dropTokens) oldest tokens (context: \(seq.count)/\(slidingWindow))\n".utf8))
+                            seq = Array(seq.dropFirst(dropTokens))
+                            // Shift all KV cache layers in the persistent prefix backend
+                            if let queue = SeedlessMetalForward.getQueue() {
+                                for kv in (self.prefixBackend?.kvCaches ?? []) {
+                                    SeedlessMetalForward.shiftKVCache(kv: kv, drop: dropTokens, queue: queue)
+                                }
+                            }
+                            produced = Swift.max(0, produced - dropTokens)
+                            // Invalidate prefix snapshots — they reference stale positions
+                            self.prefixSlots = []
+                            self.arenaContent = []
+                        }
+                    }
                     // In a strict re-arm window, cap the segment at M so we can return to bolt.
                     let inRearmWindow = lguard != nil && !boltActive && rearmCur > 0
                     let segN = inRearmWindow ? Swift.min(rearmCur, ceiling - produced)

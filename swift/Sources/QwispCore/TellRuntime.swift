@@ -104,6 +104,8 @@ extension Tell {
         // Option B GPU sampler: (tokens, draftPerRow, invT, seed, basePos) → per-row
         // (full sample, residual sample, accept). Returns the decision on-GPU, tiny readback.
         var stepSampleRows: (([Int32], [Int], Float, UInt64, Int, [Float]?, Float) -> (full: [Int], resid: [Int], accept: [Bool])?)? = nil
+        // KV cache access for sliding window context compacting
+        var kvCaches: [SeedlessFusedVerify.KVCacheBufs]? = nil
     }
 
     /// forward + lm_head logits, read back to CPU per row (for speculative sampling).
@@ -223,6 +225,7 @@ extension Tell {
                 fwd.stepSampleRows(toks, drafts: drafts, invT: invT, seed: seed, basePos: base, logitAdj: adj, topP: topP)
             }
         }
+        backend.kvCaches = fwd.allKVCaches
         return (backend, fwd)
     }
 
@@ -428,6 +431,7 @@ extension Tell {
             backend.stepArgmax = traced
             backend.chainedStepArgmax = nil
         }
+        backend.kvCaches = fwd.allKVCaches
         return backend
     }
 

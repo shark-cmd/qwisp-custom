@@ -3849,6 +3849,9 @@ public enum SeedlessFusedVerify {
         /// spec の partial reject 用: 直前 forwardRows「1 回だけ」の cache 前進を取り消すための snapshot。
         /// KV は len の巻き戻し、GDN state/conv hist は ping-pong の swap 戻し(裏面に pre-step 値)。
         public struct Snapshot { let kvLens: [Int] }
+        /// All non-nil KV cache buffers across layers (for sliding window context compacting).
+        public var allKVCaches: [KVCacheBufs] { layers.compactMap { $0.kvCache } }
+
         public func snapshot() -> Snapshot { Snapshot(kvLens: layers.map { $0.kvCache?.len ?? 0 }) }
         /// snapshot 以降に forwardRows をちょうど 1 回だけ呼んだ状態から巻き戻す(2 回以上は不可)。
         public func rollbackOneStep(_ s: Snapshot) {
