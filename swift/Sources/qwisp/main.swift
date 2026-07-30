@@ -100,6 +100,10 @@ case "serve":
         backend = sb
     }
     let engine = QwispEngine(tokenizer: tok, backend: backend, modelID: modelID, serialize: !batchMode)
+    // Flush MLX buffer pool after model load. The load allocates scratch buffers that are
+    // freed but cached by MLX. Clearing now returns them to the OS before the first request,
+    // preventing accumulation from previous process runs or repeated test restarts.
+    clearMLXCache()
     try await runServe(engine: engine, modelID: modelID, port: port)
 case "chat":
     // `--max-tokens N` | `--max-tokens=N` (matches mlx-lm); the rest of the args are the prompt.

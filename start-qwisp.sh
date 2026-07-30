@@ -17,8 +17,10 @@
 # Production example (fires only near 80K limit):
 #   QWISP_SLIDING_WINDOW=75000 QWISP_WINDOW_HEADROOM=6000
 #
-# Test example (tiny window, fires every few turns):
-#   QWISP_SLIDING_WINDOW=512 QWISP_WINDOW_HEADROOM=128
+# Recommended for agentic workloads with large system prompts (e.g. 50K tokens):
+#   QWISP_SLIDING_WINDOW=32768 QWISP_WINDOW_HEADROOM=4096
+#   → compacts to ~28K, keeps SDPA decode at full speed (~75-85 tok/s)
+#   → without this, 50K+ KV length slows decode to 24-27 tok/s
 
 set -e
 
@@ -44,8 +46,8 @@ fi
 
 echo "Starting qwisp server..."
 QWISP_PREFIX_MAX=81920 \
-QWISP_SLIDING_WINDOW=75000 \
-QWISP_WINDOW_HEADROOM=6000 \
+QWISP_SLIDING_WINDOW=32768 \
+QWISP_WINDOW_HEADROOM=4096 \
 QWISP_PORT=$QWISP_PORT \
 qwisp serve &
 QWISP_PID=$!

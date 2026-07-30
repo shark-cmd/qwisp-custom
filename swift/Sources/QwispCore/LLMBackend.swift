@@ -12,6 +12,12 @@ import MLX
 // HANDOFF.md).
 
 /// RAM/quality tier. `.auto` resolves C from device RAM (DeviceCalibration.defaultC()).
+/// Flush MLX's Metal buffer pool back to the OS. Call once after model load and after
+/// any operation that frees large Metal allocations (arena rebuild, compacting reset).
+/// Without this, MLX keeps freed buffers in a pool indefinitely, inflating resident set
+/// and causing swap pressure when physical RAM is tight.
+public func clearMLXCache() { Memory.clearCache() }
+
 public enum SeedlessTier {
     case auto
     case resident            // strict, all experts resident (≥32GB grain: C≥256)
@@ -667,6 +673,9 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                             // No empty snap yet — reset all KV lens manually
                             for kv in (backend.kvCaches ?? []) { kv.len = 0 }
                         }
+                        // Flush MLX buffer pool — the reset freed large KV allocations;
+                        // without this MLX caches them and they accumulate across compacting events.
+                        Memory.clearCache()
                         // Re-prefill the truncated content portion
                         let truncatedContent = Array(effectiveFull[0 ..< Swift.min(newContentLen, effectiveFull.count)])
                         if !truncatedContent.isEmpty {
