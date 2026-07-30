@@ -640,9 +640,10 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 let maxK = cfg.isStreaming
                     ? Swift.max(4, DeviceCalibration.strictStreamingC(tierC: cfg.c) * 3 / 8)
                     : cfg.maxK
-                // Sliding window: if prompt exceeds the window, drop oldest tokens + shift KV cache.
-                // This runs after the arena is built and content is prefilled, so the KV buffers
-                // hold positions [0..contentLen). We trim both the token sequence and the KV state.
+                // Sliding window context compacting: if the full prompt exceeds the window,
+                // drop the oldest tokens and re-prefill from scratch with the truncated sequence.
+                // RoPE encodes absolute positions into KV entries, so we cannot reuse shifted
+                // KV data — we must reset to empty and re-prefill the truncated context cleanly.
                 let slidingWindow = Tell.envInt("QWISP_SLIDING_WINDOW", 0)
                 let windowHeadroom = Tell.envInt("QWISP_WINDOW_HEADROOM", 4096)
                 var effectiveFull = full
@@ -653,12 +654,23 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                         FileHandle.standardError.write(Data(
                             "[qwisp] context compacting: dropping \(dropTokens) oldest tokens (context: \(full.count)/\(slidingWindow))\n".utf8))
                         effectiveFull = Array(full.dropFirst(dropTokens))
-                        effectiveGenSuffix = Array(effectiveFull[Swift.min(Swift.max(contentLen - dropTokens, 0), effectiveFull.count)...])
-                        // Shift KV cache for all layers
-                        if let queue = SeedlessMetalForward.getQueue() {
-                            for kv in (backend.kvCaches ?? []) {
-                                SeedlessMetalForward.shiftKVCache(kv: kv, drop: dropTokens, queue: queue)
-                            }
+                        // genSuffix is the part past contentLen; after dropping tokens from the front,
+                        // recalculate: new contentLen = max(0, contentLen - dropTokens), clamped.
+                        let newContentLen = Swift.max(0, contentLen - dropTokens)
+                        effectiveGenSuffix = Array(effectiveFull[Swift.min(newContentLen, effectiveFull.count)...])
+                        // Reset KV cache to empty then re-prefill the truncated sequence.
+                        // Cannot reuse shifted KV entries: RoPE bakes absolute positions into
+                        // each key vector, so shifted entries carry wrong position encodings.
+                        if let emptySnap = self.prefixEmptySnap {
+                            backend.fullRestore?(emptySnap)
+                        } else {
+                            // No empty snap yet — reset all KV lens manually
+                            for kv in (backend.kvCaches ?? []) { kv.len = 0 }
+                        }
+                        // Re-prefill the truncated content portion
+                        let truncatedContent = Array(effectiveFull[0 ..< Swift.min(newContentLen, effectiveFull.count)])
+                        if !truncatedContent.isEmpty {
+                            _ = Tell.prefill(promptIds: truncatedContent, backend: backend)
                         }
                         // Invalidate prefix snapshots — positions are now stale
                         self.prefixSlots = []
