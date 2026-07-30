@@ -1,16 +1,34 @@
 #!/bin/bash
-# Start qwisp server directly (no Nginx proxy needed)
-# Accessible on both localhost and Tailscale network
+# Start qwisp server directly (no Nginx proxy needed).
+# Accessible on both localhost and Tailscale network.
+#
+# Environment variables (all optional):
+#
+#   QWISP_PORT          Server port (default: 9080)
+#   QWISP_PREFIX_MAX    Max context tokens (default: 81920 = 80K)
+#   QWISP_SLIDING_WINDOW  Enable sliding window compacting.
+#                         Set to target window size in tokens (0 = disabled).
+#                         Fires when context >= QWISP_SLIDING_WINDOW - QWISP_WINDOW_HEADROOM.
+#                         On trigger: drops oldest tokens, resets KV cache, re-prefills
+#                         truncated context from scratch (correct RoPE positions).
+#   QWISP_WINDOW_HEADROOM  Tokens to preserve after compacting (default: 4096).
+#                           Effective window kept = QWISP_SLIDING_WINDOW - headroom.
+#
+# Production example (fires only near 80K limit):
+#   QWISP_SLIDING_WINDOW=75000 QWISP_WINDOW_HEADROOM=6000
+#
+# Test example (tiny window, fires every few turns):
+#   QWISP_SLIDING_WINDOW=512 QWISP_WINDOW_HEADROOM=128
 
 set -e
 
-QWISP_PORT=9080
+QWISP_PORT=${QWISP_PORT:-9080}
 TAILSCALE_IP=$(tailscale ip 2>/dev/null | head -1)
 
 echo "=== Qwisp Server ==="
 echo ""
 
-# Kill Nginx if running
+# Kill Nginx if running (no longer needed — qwisp binds 0.0.0.0 directly)
 if pgrep -x nginx > /dev/null; then
     echo "Stopping Nginx..."
     brew services stop nginx 2>/dev/null || pkill -9 nginx 2>/dev/null || true
@@ -25,7 +43,11 @@ if pgrep -f "qwisp serve" > /dev/null; then
 fi
 
 echo "Starting qwisp server..."
-QWISP_PREFIX_MAX=81920 QWISP_PORT=$QWISP_PORT qwisp serve &
+QWISP_PREFIX_MAX=81920 \
+QWISP_SLIDING_WINDOW=75000 \
+QWISP_WINDOW_HEADROOM=6000 \
+QWISP_PORT=$QWISP_PORT \
+qwisp serve &
 QWISP_PID=$!
 echo "Qwisp started (PID: $QWISP_PID)"
 sleep 3
