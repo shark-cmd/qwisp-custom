@@ -197,8 +197,10 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     private let cachedPrefixMax: Int
     private let cachedPrefixSnapStride: Int
     private let cachedPrefixMaxSlots: Int
+    private let cachedPrefixRAMBudget: Int
+    private let cachedPrefixStreaming: Bool
     func prefixRAMBudget(isStreaming: Bool) -> Int {
-        Swift.max(0, Tell.envInt("QWISP_PREFIX_RAM_MB", isStreaming ? 0 : 2048)) * 1_048_576
+        cachedPrefixRAMBudget
     }
 
     /// Read `text_config.max_position_embeddings` from the checkpoint's config.json.
@@ -236,6 +238,8 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         self.cachedPrefixMax = Swift.min(contextLen, Swift.max(4096, Tell.envInt("QWISP_PREFIX_MAX", dflt)))
         self.cachedPrefixSnapStride = Swift.max(512, Tell.envInt("QWISP_PREFIX_SNAP_STRIDE", 2048))
         self.cachedPrefixMaxSlots = Swift.max(2, Tell.envInt("QWISP_PREFIX_MAX_SLOTS", 6))
+        self.cachedPrefixRAMBudget = Swift.max(0, Tell.envInt("QWISP_PREFIX_RAM_MB", isStreamingTier ? 0 : 2048)) * 1_048_576
+        self.cachedPrefixStreaming = cachedLossless && Tell.envInt("QWISP_PREFIX_STREAMING", 1) != 0
     }
 
     public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int> {
@@ -255,7 +259,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         // is a separate follow-up. QWISP_PREFIX_STREAMING=0 opts the extension out.
         // Everything else falls through to the segmented-growth path below.
         let streamingCacheOK = !cfg.isStreaming
-            || (lossless && Tell.envInt("QWISP_PREFIX_STREAMING", 1) != 0)
+            || cachedPrefixStreaming
         if prefixCacheEnabled, streamingCacheOK, !options.sampling,
            let cl = options.promptContentLen, cl < prompt.count {
             if prompt.count + 64 <= prefixArenaMax {
