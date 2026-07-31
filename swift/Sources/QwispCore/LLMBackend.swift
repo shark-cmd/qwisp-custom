@@ -109,7 +109,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     /// tiers (<32GB) otherwise default to bolt (near-lossless L3) — productization
     /// tier→mode decision. Set by the CLI after init (resolved flag > env > config).
     public var losslessForced: Bool? = nil
-    public var lossless: Bool { losslessForced ?? (ProcessInfo.processInfo.environment["QWISP_LOSSLESS"] == "1") }
+    public var lossless: Bool { cachedLossless }
     private var boltServe: BoltServe? = nil
     private var samplingFallbackNoted = false
     // Segment gate (issue #47): a new request's decode thread must wait for the previous
@@ -150,7 +150,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     // every drafted token; snapshot/restore is byte-identical (PrefixCachePoC). ~60MB / slot (GDN state).
     public var prefixCacheForced: Bool? = nil      // test/override hook; nil → env flag
     // Default ON (lossless: PREFIXE2E gate; growth removed the truncation risk). QWISP_PREFIX_CACHE=0 opts out.
-    var prefixCacheEnabled: Bool { prefixCacheForced ?? (ProcessInfo.processInfo.environment["QWISP_PREFIX_CACHE"] != "0") }
+    var prefixCacheEnabled: Bool { cachedPrefixCacheEnabled }
     /// Arena cap default for the cached path (tokens). Resident tiers follow the model context:
     /// beyond the cap the cache is silently bypassed and EVERY turn of a long conversation
     /// re-prefills the whole history (the 64K cliff — a 77K OpenCode session paid ~12 min TTFT
@@ -169,13 +169,10 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     public static func cachedGenBudget(promptLen: Int, ceiling: Int, arenaMax: Int, genCap: Int) -> Int {
         Swift.max(1, Swift.min(ceiling, Swift.min(genCap, arenaMax - promptLen)))
     }
-    var prefixGenCap: Int { Swift.max(1024, Tell.envInt("QWISP_PREFIX_GEN_MAX", 16384)) }
-    var prefixArenaMax: Int {
-        let dflt = SeedlessBackend.prefixArenaMaxDefault(contextLen: contextLen, isStreaming: isStreamingTier)
-        return Swift.min(contextLen, Swift.max(4096, Tell.envInt("QWISP_PREFIX_MAX", dflt)))
-    }
-    var prefixSnapStride: Int { Swift.max(512, Tell.envInt("QWISP_PREFIX_SNAP_STRIDE", 2048)) }
-    var prefixMaxSlots: Int { Swift.max(2, Tell.envInt("QWISP_PREFIX_MAX_SLOTS", 6)) }
+    var prefixGenCap: Int { cachedPrefixGenCap }
+    var prefixArenaMax: Int { cachedPrefixMax }
+    var prefixSnapStride: Int { cachedPrefixSnapStride }
+    var prefixMaxSlots: Int { cachedPrefixMaxSlots }
     private var prefixBackend: Tell.SpecBackend?
     // Streaming tier (#76): the C-slot expert arena persists across cached-backend rebuilds
     // (only the KV/GDN arena is rebuilt on growth) — rebuilding providers would re-stream GBs.
@@ -189,11 +186,17 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     // default 2GB resident / OFF streaming (wired-memory pressure — see PR #70).
     private var prefixRAM = PrefixRAMStore()
     public private(set) var prefixRAMHits = 0               // gate observability, mirrors PrefixPersist.restoreHits
-    // Cached sliding-window env vars (resolved once at init, not per-request).
+    // Cached env vars (resolved once at init, not per-request).
     private let slidingWindow: Int
     private let windowHeadroom: Int
     private let hybridPrefillEnabled: Bool
     private let mixedEnabled: Int
+    private let cachedLossless: Bool
+    private let cachedPrefixCacheEnabled: Bool
+    private let cachedPrefixGenCap: Int
+    private let cachedPrefixMax: Int
+    private let cachedPrefixSnapStride: Int
+    private let cachedPrefixMaxSlots: Int
     func prefixRAMBudget(isStreaming: Bool) -> Int {
         Swift.max(0, Tell.envInt("QWISP_PREFIX_RAM_MB", isStreaming ? 0 : 2048)) * 1_048_576
     }
@@ -226,6 +229,13 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         self.windowHeadroom = Tell.envInt("QWISP_WINDOW_HEADROOM", 4096)
         self.hybridPrefillEnabled = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0"
         self.mixedEnabled = Tell.envInt("QWISP_MIXED", 1)
+        self.cachedLossless = losslessForced ?? (ProcessInfo.processInfo.environment["QWISP_LOSSLESS"] == "1")
+        self.cachedPrefixCacheEnabled = prefixCacheForced ?? (ProcessInfo.processInfo.environment["QWISP_PREFIX_CACHE"] != "0")
+        self.cachedPrefixGenCap = Swift.max(1024, Tell.envInt("QWISP_PREFIX_GEN_MAX", 16384))
+        let dflt = Swift.min(contextLen, 81920)
+        self.cachedPrefixMax = Swift.min(contextLen, Swift.max(4096, Tell.envInt("QWISP_PREFIX_MAX", dflt)))
+        self.cachedPrefixSnapStride = Swift.max(512, Tell.envInt("QWISP_PREFIX_SNAP_STRIDE", 2048))
+        self.cachedPrefixMaxSlots = Swift.max(2, Tell.envInt("QWISP_PREFIX_MAX_SLOTS", 6))
     }
 
     public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int> {
