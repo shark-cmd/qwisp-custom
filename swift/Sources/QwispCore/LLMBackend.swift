@@ -192,6 +192,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     private let hybridPrefillEnabled: Bool
     private let mixedEnabled: Int
     private let cachedLossless: Bool
+    private let clearCacheOnGrowth: Bool
     private let cachedPrefixCacheEnabled: Bool
     private let cachedPrefixGenCap: Int
     private let cachedPrefixMax: Int
@@ -232,6 +233,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         self.hybridPrefillEnabled = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0"
         self.mixedEnabled = Tell.envInt("QWISP_MIXED", 1)
         self.cachedLossless = losslessForced ?? (ProcessInfo.processInfo.environment["QWISP_LOSSLESS"] == "1")
+        self.clearCacheOnGrowth = ProcessInfo.processInfo.environment["QWISP_CLEAR_CACHE_ON_GROWTH"] != "0"
         self.cachedPrefixCacheEnabled = prefixCacheForced ?? (ProcessInfo.processInfo.environment["QWISP_PREFIX_CACHE"] != "0")
         self.cachedPrefixGenCap = Swift.max(1024, Tell.envInt("QWISP_PREFIX_GEN_MAX", 16384))
         let dflt = Swift.min(contextLen, 81920)
@@ -539,9 +541,14 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     if self.prefixBackend != nil {
                         self.prefixBackend = nil
                         self.prefixSlots = []; self.arenaContent = []; self.prefixEmptySnap = nil
-                        // NOTE: Do NOT call Memory.clearCache() here - it clears MLX's
-                        // buffer pool and forces re-allocation, killing performance.
-                        // MLX will reuse the freed arena buffers for the new arena.
+                        // Upstream v0.3.11 (4a90737) measured this targeted clearCache (growth
+                        // rebuild only, ~3-4x per server lifetime: 16K→32K→64K→80K): −22.5GB
+                        // peak footprint AND ~10% faster on a 64GB box (26GB of pool on top
+                        // of resident weights = memory pressure). NOT the same as clearing in
+                        // the hot path (startup / per-request / per-compact), which we
+                        // measured as 5-10x slower — that stays out. QWISP_CLEAR_CACHE_ON_GROWTH=0
+                        // opts back to letting MLX reuse the freed buffers.
+                        if self.clearCacheOnGrowth { Memory.clearCache() }
                     }
                     let built: Tell.SpecBackend?
                     if cfg.isStreaming {

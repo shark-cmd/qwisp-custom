@@ -179,6 +179,25 @@ Also present in `generate()` (non-cached / bolt path) for completeness, but that
 | `48cbc8b`…`e75ddc0` | perf: cache env vars at init (hot-path lookups eliminated) |
 | `030569f` | **Fix: eliminate double prefill** — compact BEFORE prefill so retained context is prefilled once (37.5s → 8.8s @ 9610 tok). Also fixes the Swift-6 closure `self` build breakage that silently blocked all builds after the env-caching commits. |
 
+## Upstream comparison (penta2himajin/qwisp, v0.3.11)
+
+Checked 2026-08-01. The fork already carries all of upstream v0.3.11's `LLMBackend`
+work (`isStreamingTier`, `prefixArenaMaxDefault`, `cachedGenBudget`, the 64K-cliff
+BYPASS warning, client-abort check in the delta prefill) and is AHEAD on:
+
+- **Tools.swift NSNull fix** — upstream v0.3.11 still returns `NSNull()` (crashes the
+  `content` field decoding on `messages: [{"content": null}]`); the fork ships the fix.
+- **Streaming robustness** — StreamDetok multibyte fix, `<tool_call>` buffering, generate
+  loop error logging (upstream has only a `prompt(req)` wrapper).
+- **Sliding window compacting** — upstream has no such feature.
+
+Adopted from upstream: `Memory.clearCache()` on KV-arena GROWTH rebuild (4a90737;
+measured −22.5GB peak + ~10% faster on 64GB). A/B on the 35K workload: 141.9s → 139.4s
+(noise), free RAM 1.0GB → 2.9GB. Kill switch: `QWISP_CLEAR_CACHE_ON_GROWTH=0`.
+NOT adopted: LaneServe token-budget scheduler / ctx-adaptive arenas (QWISP_LANES path
+only, not used by the Hermes streaming tier) and the MMA-prefill kernel (WS-A NO-GO
+verdict, flag-off default is byte-identical anyway).
+
 ---
 
 ## Known limitations
