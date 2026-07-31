@@ -12,14 +12,11 @@ import MLX
 // HANDOFF.md).
 
 /// RAM/quality tier. `.auto` resolves C from device RAM (DeviceCalibration.defaultC()).
-/// Flush MLX's Metal buffer pool back to the OS and set a cache limit.
-/// Call once after model load and after any operation that frees large Metal allocations
-/// (arena rebuild, compacting reset). Without this, MLX keeps freed buffers in a pool
-/// indefinitely, inflating resident set and causing swap pressure when physical RAM is tight.
-/// The cache limit prevents the pool from growing beyond QWISP_MLX_CACHE_GB (default 4 GB).
+/// Flush MLX's Metal buffer pool back to the OS. Call after any operation that frees
+/// large Metal allocations (arena rebuild, compacting reset).
+/// NOTE: Do NOT call on startup - it clears MLX's buffer pool and forces re-allocation,
+/// killing performance. Only call when we need to free memory (compacting, arena rebuild).
 public func clearMLXCache() {
-    let cacheGB = Tell.envInt("QWISP_MLX_CACHE_GB", 4) * 1024 * 1024 * 1024
-    Memory.cacheLimit = cacheGB
     Memory.clearCache()
 }
 
@@ -678,9 +675,9 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                             // No empty snap yet — reset all KV lens manually
                             for kv in (backend.kvCaches ?? []) { kv.len = 0 }
                         }
-                        // Flush MLX buffer pool — the reset freed large KV allocations;
-                        // without this MLX caches them and they accumulate across compacting events.
-                        Memory.clearCache()
+                        // NOTE: Do NOT call Memory.clearCache() here - it clears MLX's
+                        // buffer pool and forces re-allocation, killing performance.
+                        // MLX will reuse the freed KV buffers for the re-prefill.
                         // Re-prefill the truncated content portion
                         let truncatedContent = Array(effectiveFull[0 ..< Swift.min(newContentLen, effectiveFull.count)])
                         if !truncatedContent.isEmpty {
