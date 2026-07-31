@@ -4968,6 +4968,7 @@ public enum SeedlessMetalForward {
                              constant int& v_head_stride[[buffer(8)]],
                              constant int& v_seq_stride [[buffer(9)]],
                              constant float& scale      [[buffer(10)]],
+                             constant int& key_start    [[buffer(11)]],   // first key position attended (decode window; 0 = full causal context)
                              uint3 tid [[threadgroup_position_in_grid]],
                              uint3 tpg [[threadgroups_per_grid]],
                              uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -4986,17 +4987,18 @@ public enum SeedlessMetalForward {
                 const int q_seq_idx = tid.y;             // 行 m
                 const int kv_head_idx = q_batch_head_idx / gqa_factor;
                 const int N = baseN + q_seq_idx;         // 行 m の causal prefix 長
+                const int KS = key_start;                // windowed decode: attend [KS, N)
                 const int o_offset = q_seq_idx * (int)tpg.x + q_batch_head_idx;   // m*H + h
                 const int q_offset = o_offset;
                 queries += q_offset * D + simd_lid * qk_per_thread;
-                keys   += kv_head_idx * k_head_stride + simd_gid * k_seq_stride + simd_lid * qk_per_thread;
-                values += kv_head_idx * v_head_stride + simd_gid * v_seq_stride + simd_lid * v_per_thread;
+                keys   += kv_head_idx * k_head_stride + (KS + simd_gid) * k_seq_stride + simd_lid * qk_per_thread;
+                values += kv_head_idx * v_head_stride + (KS + simd_gid) * v_seq_stride + simd_lid * v_per_thread;
                 out += o_offset * V + simd_gid * v_per_thread;
                 for (int i = 0; i < qk_per_thread; i++) q[i] = (U)scale * queries[i];
                 for (int i = 0; i < v_per_thread; i++) o[i] = 0;
                 U max_score = -INFINITY;
                 U sum_exp_score = 0;
-                for (int i = simd_gid; i < N; i += BN) {
+                for (int i = KS + simd_gid; i < N; i += BN) {
                     for (int j = 0; j < qk_per_thread; j++) k[j] = keys[j];
                     U score = 0;
                     for (int j = 0; j < qk_per_thread; j++) score += q[j] * k[j];

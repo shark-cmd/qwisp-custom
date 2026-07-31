@@ -1978,17 +1978,19 @@ public enum SeedlessFusedVerify {
     /// sdpa_rows(既存 _sdpaRowsPipeline)を encode-only で提供。k/v は cache buffer [KV, maxLen, D]
     /// (stride を maxLen 基準で渡す — 論理位置の値列は composed と同一なので bit 一致)。
     static func encodeSdpaRows(_ enc: MTLComputeCommandEncoder, q: MTLBuffer, k: MTLBuffer, v: MTLBuffer, out: MTLBuffer,
-                               H: Int, KV: Int, D: Int, baseLenPlus1: Int, M: Int, scale: Float, maxLen: Int) {
+                               H: Int, KV: Int, D: Int, baseLenPlus1: Int, M: Int, scale: Float, maxLen: Int,
+                               keyStart: Int = 0) {
         let p = SeedlessMetalForward._sdpaRowsPipeline!
         enc.setComputePipelineState(p)
         enc.setBuffer(q, offset: 0, index: 0); enc.setBuffer(k, offset: 0, index: 1)
         enc.setBuffer(v, offset: 0, index: 2); enc.setBuffer(out, offset: 0, index: 3)
         var gqa = Int32(H / KV), bn = Int32(baseLenPlus1)
         var khs = Int32(maxLen * D), kss = Int32(D), vhs = Int32(maxLen * D), vss = Int32(D), sc = scale
+        var ks = Int32(keyStart)
         enc.setBytes(&gqa, length: 4, index: 4); enc.setBytes(&bn, length: 4, index: 5)
         enc.setBytes(&khs, length: 4, index: 6); enc.setBytes(&kss, length: 4, index: 7)
         enc.setBytes(&vhs, length: 4, index: 8); enc.setBytes(&vss, length: 4, index: 9)
-        enc.setBytes(&sc, length: 4, index: 10)
+        enc.setBytes(&sc, length: 4, index: 10); enc.setBytes(&ks, length: 4, index: 11)
         enc.dispatchThreadgroups(MTLSize(width: H, height: M, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
     }
@@ -2346,6 +2348,17 @@ public enum SeedlessFusedVerify {
         // v-cache 散布(raw v, always unfused)
         encodeWriteKVRows(enc, src: sc.vOut, cache: kv.vCache, KV: numKV, D: headDim, maxLen: kv.maxLen, pos: baseLen, M: M)
         // ⑤ SDPA(行 m は先頭 baseLen+m+1 key)
+        // Decode-window (streaming-LLM style): for M==1, cap the attended key span to the last
+        // QWISP_DECODE_WINDOW tokens (keys keep absolute RoPE; KV is NOT truncated — prefix-cache
+        // reuse is untouched). SDPA cost ∝ N → at 52K context decode drops to ~21 tok/s; windowing
+        // to 16K restores ~2x. M>1 (prefill) is never windowed: the KV being built needs full
+        // attention. 0 = disabled (byte-identical path).
+        let keyStart: Int
+        if M == 1 && SeedlessFusedForward.decodeWindowTokens > 0 {
+            keyStart = Swift.max(0, baseLen + 1 - SeedlessFusedForward.decodeWindowTokens)
+        } else {
+            keyStart = 0
+        }
         // WS-A #137: QWISP_ATTN_MMA_PREFILL default OFF ⇒ always the sdpaRows branch below
         // (byte-identical to before this kernel existed). ON swaps in the additive
         // flash-style MMA kernel — ONLY reachable via forwardRowsHybrid's prefill seam.
@@ -2354,7 +2367,8 @@ public enum SeedlessFusedVerify {
                            H: numHeads, KV: numKV, D: headDim, baseLenPlus1: baseLen + 1, M: M, scale: scale, maxLen: kv.maxLen)
         } else {
             encodeSdpaRows(enc, q: sc.qRot, k: kv.kCache, v: kv.vCache, out: sc.attnOut,
-                           H: numHeads, KV: numKV, D: headDim, baseLenPlus1: baseLen + 1, M: M, scale: scale, maxLen: kv.maxLen)
+                           H: numHeads, KV: numKV, D: headDim, baseLenPlus1: baseLen + 1, M: M, scale: scale, maxLen: kv.maxLen,
+                           keyStart: keyStart)
         }
         // ⑥ sigmoid gate → o_proj
         encodeSigmoidMul(enc, attnOut: sc.attnOut, qOut: sc.qOut, gated: sc.gated,
@@ -3117,6 +3131,14 @@ public enum SeedlessFusedVerify {
         /// so this constant is the sole source of the unset default. QWISP_CHAIN_K=0
         /// still disables (envInt returns 0).
         public static let chainKDefault = 8
+
+        /// Decode-window (streaming-LLM style): cap the attended key span to the last N tokens
+        /// during M==1 decode only. QWISP_DECODE_WINDOW tokens (0 = disabled, byte-identical
+        /// path). Read once at first use (hot path; not a per-call env lookup). Prefill (M>1)
+        /// is never windowed — the KV being built needs full causal attention.
+        public static let decodeWindowTokens: Int = {
+            Swift.max(0, Tell.envInt("QWISP_DECODE_WINDOW", 0))
+        }()
 
         /// M-branch predicate for the fuseGU path.
         /// Contract: fuseGUActive(M) == (fuseGU && M == 1)
