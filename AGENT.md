@@ -61,21 +61,25 @@ Set `QWISP_SLIDING_WINDOW=0` to disable compacting entirely (zero overhead).
 
 ### Code path
 
-All streaming non-sampling requests route through `generateCached()` in `LLMBackend.swift`, not `generate()`. The sliding window check lives just before the `Tell.runSpecLoop` call inside `generateCached()`.
+All streaming non-sampling requests route through `generateCached()` in `LLMBackend.swift`, not `generate()`. The sliding window check runs at the TOP of `generateCached()` — BEFORE any prefill — so the retained context is prefilled exactly once.
 
 ### Logic (simplified)
 
 ```
 full = all prompt tokens (system + history + current user turn)
+content = full[0..<contentLen]        # cached content boundary
 if full.count >= QWISP_SLIDING_WINDOW - QWISP_WINDOW_HEADROOM:
     drop = full.count - QWISP_SLIDING_WINDOW + QWISP_WINDOW_HEADROOM
-    effectiveFull = full[drop...]          # drop oldest tokens
-    reset KV cache to empty snapshot       # via prefixEmptySnap / kv.len = 0
-    re-prefill effectiveFull[0..<newContentLen]  # fresh RoPE-correct KV entries
-    invalidate prefixSlots, arenaContent   # stale snapshots gone
-    effectiveGenSuffix = effectiveFull[newContentLen...]
-Tell.runSpecLoop(promptIds: effectiveFull, prefillTokens: effectiveGenSuffix, ...)
+    content = content[drop...]        # drop oldest tokens from the CONTENT
+    reset KV cache to empty snapshot  # via prefixEmptySnap / kv.len = 0
+    compacted = true                  # arena restart: restoreLen=0, slots cleared
+# (only if !compacted) multi-slot / RAM / disk restore of the cached arena
+# delta prefill loop prefills `content` ONCE (0..<content.count)
+Tell.runSpecLoop(promptIds: compacted ? content+genSuffix : full,
+                 prefillTokens: genSuffix, ...)   # genSuffix is UNCHANGED by compacting
 ```
+
+**Why check before prefill (not after):** the old implementation prefilled the full prompt, then restored to empty and re-prefilled the truncated sequence — doubling prefill cost (~2x TTFT on 50K-token Hermes prompts). Checking first means the truncated content is prefilled exactly once. Measured on a 9610-token prompt with a 4096 window: 37.5s → 8.8s (4.3x). Note `genSuffix` is untouched by compacting: dropping from the front shifts contentLen by `drop`, so the suffix (which starts at contentLen) stays where it is.
 
 ### Why re-prefill (not KV shift)
 
@@ -96,11 +100,12 @@ The `shift_kv` MSL kernel and `shiftKVCache` Swift API exist in `SeedlessMetalFo
 ### Observed behaviour
 
 ```
-[qwisp] context compacting: dropping 6144 oldest tokens (context: 75264/75000)
-[qwisp] stream prompt=75264 prefill=310 tok/s gen=600 ttft=3600ms ...
+[qwisp] context compacting: dropping 6358 oldest tokens (context: 35030/32768)
+[qwisp] prefill 1024/2048 (50%) · 434 tok/s      # single prefill of the retained 28.6K
+[qwisp] complete prompt=35030 prefill=214 tok/s gen=172 ttft=134876ms decode=27.1 tok/s (141.17s)
 ```
 
-After the extra prefill cost (~3–5s for 69K retained tokens), subsequent turns resume at normal decode speed.
+The retained context is prefilled exactly once (pre-compaction check). Coherent output verified after compacting at scale (9×8 → '72').
 
 ---
 
@@ -171,12 +176,14 @@ Also present in `generate()` (non-cached / bolt path) for completeness, but that
 | `77c4f3a` | Add sliding window: Metal shift_kv kernel + Swift API + LLMBackend integration |
 | `aee8f17` | Fix: move sliding window check into generateCached() (actual streaming code path) |
 | `1812b3d` | Fix: replace KV shift with reset+reprefill (correct RoPE position alignment) |
+| `48cbc8b`…`e75ddc0` | perf: cache env vars at init (hot-path lookups eliminated) |
+| `030569f` | **Fix: eliminate double prefill** — compact BEFORE prefill so retained context is prefilled once (37.5s → 8.8s @ 9610 tok). Also fixes the Swift-6 closure `self` build breakage that silently blocked all builds after the env-caching commits. |
 
 ---
 
 ## Known limitations
 
 - **Compacting cuts conversation history.** After dropping oldest tokens, the model loses early conversation context. For typical agentic workloads the most recent context matters most, so this is acceptable.
-- **Re-prefill latency.** Each compacting event adds ~1–5s (proportional to retained context length). With `QWISP_SLIDING_WINDOW=75000` this fires at most once per 80K-token conversation.
+- **Re-prefill latency.** Each compacting event re-prefills the retained context (~28.6K tokens ≈ 70–135s on a 35B model). This replaces the old double-prefill cost; the retained context is prefilled exactly once.
 - **Prefix cache invalidated on compact.** All cross-turn prefix snapshots are cleared. The first turn after compacting pays a full prefill cost; subsequent turns rebuild the cache normally.
 - **Thinking tokens.** Qwen3 emits `reasoning_content` before `content`. Many clients ignore `reasoning_content`. Use `max_tokens >= 500` or `enable_thinking: false` to get the final answer token.
