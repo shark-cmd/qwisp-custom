@@ -278,6 +278,12 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
             // detached decode so it stops at the next spec-step boundary instead of running to the
             // ceiling on the (exclusive) GPU and overlapping the next request's decode.
             continuation.onTermination = { _ in cancel.cancel() }
+            // Local copies of cached env config — closure-safe (no explicit self capture needed)
+            // and immune to the Swift-6 implicit-self rule for property refs in closures.
+            let slidingWindow = self.slidingWindow
+            let windowHeadroom = self.windowHeadroom
+            let hybridPrefillEnabled = self.hybridPrefillEnabled
+            let mixedEnabled = self.mixedEnabled
             // Decode is synchronous + GPU-bound → run off the caller's task, yielding each token as
             // it lands. The spec backend is built INSIDE the thread so no non-Sendable state is
             // captured; generation is serialized upstream (server AsyncLock).
@@ -506,6 +512,10 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         let cancel = CancelFlag()
         return AsyncStream { continuation in
             continuation.onTermination = { _ in cancel.cancel() }
+            // Local copies of cached env config — closure-safe (Swift-6 explicit-self rule).
+            let slidingWindow = self.slidingWindow
+            let windowHeadroom = self.windowHeadroom
+            let hybridPrefillEnabled = self.hybridPrefillEnabled
             Thread.detachNewThread {
                 self.segGate.wait()           // same gate as generate() — one decode thread at a time
                 defer { self.segGate.signal() }
@@ -559,7 +569,23 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 }
                 let backend = self.prefixBackend!
                 let full = prompt.map { Int32($0) }
-                let content = Array(full[0 ..< contentLen])
+                var content = Array(full[0 ..< contentLen])
+                // Sliding window compacting — checked BEFORE any prefill so the retained context is
+                // prefilled exactly once. (Prefilling the full prompt and then restoring to empty and
+                // re-prefilling the truncated sequence would double the prefill cost — ~2x TTFT on
+                // 50K-token Hermes prompts.) RoPE bakes absolute positions into KV entries, so the
+                // cache cannot be shifted — the truncated sequence is re-prefilled from position 0.
+                var compacted = false
+                if slidingWindow > 0 && full.count >= slidingWindow - windowHeadroom {
+                    let dropTokens = full.count - slidingWindow + windowHeadroom
+                    if dropTokens > 0 {
+                        FileHandle.standardError.write(Data(
+                            "[qwisp] context compacting: dropping \(dropTokens) oldest tokens (context: \(full.count)/\(slidingWindow))\n".utf8))
+                        content = Array(content.dropFirst(dropTokens))
+                        compacted = true
+                    }
+                }
+                var genSuffix = Array(full[contentLen...])
 
                 // Multi-slot restore: the longest cached restore point that is a prefix of the new
                 // content (positions [0..len] still hold that prefix — append-only KV). A NEW
@@ -570,7 +596,16 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 // #117 RAM tier: another conversation's stored state whose prefix beats the
                 // in-path restore point by more than a restore is worth (~512 tok of prefill).
                 self.prefixRAM.budget = self.prefixRAMBudget(isStreaming: cfg.isStreaming)
-                if let hit = self.prefixRAM.bestMatch(content: content), hit.tokens.count > restoreLen + 512 {
+                if compacted {
+                    // The arena (if any) holds pre-compaction positions (RoPE-baked) — reset to
+                    // empty; the truncated content is re-prefilled below from position 0.
+                    self.arenaContent = []; self.prefixSlots = []; restoreLen = 0
+                    if let e = self.prefixEmptySnap {
+                        backend.fullRestore?(e)
+                    } else {
+                        for kv in (backend.kvCaches ?? []) { kv.len = 0 }
+                    }
+                } else if let hit = self.prefixRAM.bestMatch(content: content), hit.tokens.count > restoreLen + 512 {
                     if backend.restorePersistentState?(hit.state) == true {
                         self.arenaContent = hit.tokens
                         self.prefixSlots = []
@@ -624,11 +659,11 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     }
                 }
 
-                // Re-prefill the delta [restoreLen ..< contentLen], snapshotting at stride-aligned
+                // Re-prefill the delta [restoreLen ..< content.count], snapshotting at stride-aligned
                 // boundaries (so different conversations that share a prefix snapshot at the SAME
                 // positions → cross-conversation reuse), plus one at the content boundary.
                 var pos = restoreLen
-                while pos < contentLen {
+                while pos < content.count {
                     // Client abort (2026-07-22): without this check a 30K+ delta prefill grinds
                     // the GPU for minutes after disconnect, and the next request queues behind
                     // segGate. The arena keeps [0, pos) — the next request's LCP resumes there.
@@ -637,13 +672,13 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                         continuation.finish()
                         return
                     }
-                    let end = Swift.min(pos - (pos % self.prefixSnapStride) + self.prefixSnapStride, contentLen)
+                    let end = Swift.min(pos - (pos % self.prefixSnapStride) + self.prefixSnapStride, content.count)
                     _ = Tell.prefill(promptIds: Array(content[pos ..< end]), backend: backend)
                     if let snap = backend.fullSnapshot?() { self.prefixSlots.append((len: end, snap: snap)) }
                     pos = end
                 }
-                if self.prefixSlots.last?.len != contentLen, let snap = backend.fullSnapshot?() {
-                    self.prefixSlots.append((len: contentLen, snap: snap))
+                if self.prefixSlots.last?.len != content.count, let snap = backend.fullSnapshot?() {
+                    self.prefixSlots.append((len: content.count, snap: snap))
                 }
                 self.prefixSlots.sort { $0.len < $1.len }
                 self.evictSlots()
@@ -664,57 +699,16 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 }
 
                 // Prefill the generation-prompt suffix + decode. prefillTokens = suffix (arena already
-                // holds content); hist = the full prompt so SuffixSpec drafting is unchanged.
-                let genSuffix = Array(full[contentLen...])
+                // holds the (possibly compacted) content); hist = the full prompt so SuffixSpec
+                // drafting is unchanged.
                 // Streaming (#76): maxK follows the budget-fit C actually driving the backend,
                 // not the tier C (mirrors generate()'s strictMaxK).
                 let maxK = cfg.isStreaming
                     ? Swift.max(4, DeviceCalibration.strictStreamingC(tierC: cfg.c) * 3 / 8)
                     : cfg.maxK
-                // Sliding window context compacting: if the full prompt exceeds the window,
-                // drop the oldest tokens and re-prefill from scratch with the truncated sequence.
-                // RoPE encodes absolute positions into KV entries, so we cannot reuse shifted
-                // KV data — we must reset to empty and re-prefill the truncated context cleanly.
-                // Uses cached values from init (no env lookups in hot path).
-                var effectiveFull = full
-                var effectiveGenSuffix = genSuffix
-                if slidingWindow > 0 && full.count >= slidingWindow - windowHeadroom {
-                    let dropTokens = full.count - slidingWindow + windowHeadroom
-                    if dropTokens > 0 {
-                        FileHandle.standardError.write(Data(
-                            "[qwisp] context compacting: dropping \(dropTokens) oldest tokens (context: \(full.count)/\(slidingWindow))\n".utf8))
-                        effectiveFull = Array(full.dropFirst(dropTokens))
-                        // genSuffix is the part past contentLen; after dropping tokens from the front,
-                        // recalculate: new contentLen = max(0, contentLen - dropTokens), clamped.
-                        let newContentLen = Swift.max(0, contentLen - dropTokens)
-                        effectiveGenSuffix = Array(effectiveFull[Swift.min(newContentLen, effectiveFull.count)...])
-                        // Reset KV cache to empty then re-prefill the truncated sequence.
-                        // Cannot reuse shifted KV entries: RoPE bakes absolute positions into
-                        // each key vector, so shifted entries carry wrong position encodings.
-                        if let emptySnap = self.prefixEmptySnap {
-                            backend.fullRestore?(emptySnap)
-                        } else {
-                            // No empty snap yet — reset all KV lens manually
-                            for kv in (backend.kvCaches ?? []) { kv.len = 0 }
-                        }
-                        // NOTE: Do NOT call Memory.clearCache() here - it clears MLX's
-                        // buffer pool and forces re-allocation, killing performance.
-                        // MLX will reuse the freed KV buffers for the re-prefill.
-                        // Re-prefill the truncated content portion
-                        let truncatedContent = Array(effectiveFull[0 ..< Swift.min(newContentLen, effectiveFull.count)])
-                        if !truncatedContent.isEmpty {
-                            _ = Tell.prefill(promptIds: truncatedContent, backend: backend)
-                        }
-                        // Invalidate prefix snapshots — positions are now stale
-                        self.prefixSlots = []
-                        self.arenaContent = []
-                    }
-                }
-
-                // Prefill the generation-prompt suffix + decode. prefillTokens = suffix (arena already
-                // holds content); hist = the full prompt so SuffixSpec drafting is unchanged.
-                _ = Tell.runSpecLoop(promptIds: effectiveFull, backend: backend, engine: self.engine,
-                                     N: genBudget, maxK: maxK, prefillTokens: effectiveGenSuffix,
+                let hist = compacted ? (content + genSuffix) : full
+                _ = Tell.runSpecLoop(promptIds: hist, backend: backend, engine: self.engine,
+                                     N: genBudget, maxK: maxK, prefillTokens: genSuffix,
                                      isCancelled: { cancel.isCancelled },
                                      onToken: { continuation.yield($0) })
                 continuation.finish()
