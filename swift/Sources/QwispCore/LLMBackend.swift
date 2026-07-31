@@ -193,6 +193,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     private let slidingWindow: Int
     private let windowHeadroom: Int
     private let hybridPrefillEnabled: Bool
+    private let mixedEnabled: Int
     func prefixRAMBudget(isStreaming: Bool) -> Int {
         Swift.max(0, Tell.envInt("QWISP_PREFIX_RAM_MB", isStreaming ? 0 : 2048)) * 1_048_576
     }
@@ -224,6 +225,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         self.slidingWindow = Tell.envInt("QWISP_SLIDING_WINDOW", 0)
         self.windowHeadroom = Tell.envInt("QWISP_WINDOW_HEADROOM", 4096)
         self.hybridPrefillEnabled = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0"
+        self.mixedEnabled = Tell.envInt("QWISP_MIXED", 1)
     }
 
     public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int> {
@@ -374,7 +376,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                             //   disables). No checkpoint → generic bolt (warn only on explicit opt-in —
                             //   never silently change the model).
                             var tailDir: String? = nil
-                            if Tell.envInt("QWISP_MIXED", 1) != 0 {
+                            if mixedEnabled != 0 {
                                 let home = FileManager.default.homeDirectoryForCurrentUser.path
                                 let candidates = ProcessInfo.processInfo.environment["QWISP_EXPERTS_2BIT"].map { [$0] }
                                     ?? ["\(home)/.mtplx/models/qwisp-experts-2bit-cal128",
