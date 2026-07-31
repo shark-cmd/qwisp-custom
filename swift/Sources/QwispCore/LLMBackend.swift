@@ -189,6 +189,10 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     // default 2GB resident / OFF streaming (wired-memory pressure — see PR #70).
     private var prefixRAM = PrefixRAMStore()
     public private(set) var prefixRAMHits = 0               // gate observability, mirrors PrefixPersist.restoreHits
+    // Cached sliding-window env vars (resolved once at init, not per-request).
+    private let slidingWindow: Int
+    private let windowHeadroom: Int
+    private let hybridPrefillEnabled: Bool
     func prefixRAMBudget(isStreaming: Bool) -> Int {
         Swift.max(0, Tell.envInt("QWISP_PREFIX_RAM_MB", isStreaming ? 0 : 2048)) * 1_048_576
     }
@@ -217,6 +221,9 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         }
         self.store = store
         self.engine = SeedlessEngine.build(store: store)
+        self.slidingWindow = Tell.envInt("QWISP_SLIDING_WINDOW", 0)
+        self.windowHeadroom = Tell.envInt("QWISP_WINDOW_HEADROOM", 4096)
+        self.hybridPrefillEnabled = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0"
     }
 
     public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int> {
@@ -332,9 +339,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     produced = g.gen.count
                 }
                 // Sliding window context compacting: when context approaches limit, shift KV cache
-                let slidingWindow = Tell.envInt("QWISP_SLIDING_WINDOW", 0)  // 0 = disabled
-                let windowHeadroom = Tell.envInt("QWISP_WINDOW_HEADROOM", 4096)  // tokens to keep after shift
-
+                // Uses cached values from init (no env lookups in hot path).
                 while produced < ceiling && !cancel.isCancelled {
                     // Sliding window: if enabled, compact when seq approaches limit
                     if slidingWindow > 0 && seq.count >= slidingWindow - windowHeadroom {
@@ -413,7 +418,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                                                 maxM: cfg.maxM, maxSeqLen: maxSeqLen, C: strictC).map { $0.0 }
                         : Tell.fusedBackend(
                             engine: self.engine,
-                            maxM: ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" ? Swift.max(cfg.maxM, 1032) : cfg.maxM,
+                            maxM: hybridPrefillEnabled ? Swift.max(cfg.maxM, 1032) : cfg.maxM,
                             maxSeqLen: maxSeqLen)
                     guard let backend = sb else { break }
                     // Each segment dispatches to greedy or sampling. Sampling keeps its own state
@@ -508,7 +513,9 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     if self.prefixBackend != nil {
                         self.prefixBackend = nil
                         self.prefixSlots = []; self.arenaContent = []; self.prefixEmptySnap = nil
-                        Memory.clearCache()
+                        // NOTE: Do NOT call Memory.clearCache() here - it clears MLX's
+                        // buffer pool and forces re-allocation, killing performance.
+                        // MLX will reuse the freed arena buffers for the new arena.
                     }
                     let built: Tell.SpecBackend?
                     if cfg.isStreaming {
@@ -524,7 +531,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                         } else { built = nil }
                     } else {
                         // Steel-prefill hybrid wants chunk=1024 → bump maxM (scratch ~200MB, resident tier).
-                        let mm = ProcessInfo.processInfo.environment["QWISP_HYBRID_PREFILL"] != "0" ? Swift.max(cfg.maxM, 1032) : cfg.maxM
+                        let mm = hybridPrefillEnabled ? Swift.max(cfg.maxM, 1032) : cfg.maxM
                         built = Tell.fusedBackend(engine: self.engine, maxM: mm, maxSeqLen: newLen)
                     }
                     guard let b = built else {
@@ -652,8 +659,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 // drop the oldest tokens and re-prefill from scratch with the truncated sequence.
                 // RoPE encodes absolute positions into KV entries, so we cannot reuse shifted
                 // KV data — we must reset to empty and re-prefill the truncated context cleanly.
-                let slidingWindow = Tell.envInt("QWISP_SLIDING_WINDOW", 0)
-                let windowHeadroom = Tell.envInt("QWISP_WINDOW_HEADROOM", 4096)
+                // Uses cached values from init (no env lookups in hot path).
                 var effectiveFull = full
                 var effectiveGenSuffix = genSuffix
                 if slidingWindow > 0 && full.count >= slidingWindow - windowHeadroom {
