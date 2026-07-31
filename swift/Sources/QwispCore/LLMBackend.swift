@@ -12,11 +12,16 @@ import MLX
 // HANDOFF.md).
 
 /// RAM/quality tier. `.auto` resolves C from device RAM (DeviceCalibration.defaultC()).
-/// Flush MLX's Metal buffer pool back to the OS. Call once after model load and after
-/// any operation that frees large Metal allocations (arena rebuild, compacting reset).
-/// Without this, MLX keeps freed buffers in a pool indefinitely, inflating resident set
-/// and causing swap pressure when physical RAM is tight.
-public func clearMLXCache() { Memory.clearCache() }
+/// Flush MLX's Metal buffer pool back to the OS and set a cache limit.
+/// Call once after model load and after any operation that frees large Metal allocations
+/// (arena rebuild, compacting reset). Without this, MLX keeps freed buffers in a pool
+/// indefinitely, inflating resident set and causing swap pressure when physical RAM is tight.
+/// The cache limit prevents the pool from growing beyond QWISP_MLX_CACHE_GB (default 4 GB).
+public func clearMLXCache() {
+    let cacheGB = Tell.envInt("QWISP_MLX_CACHE_GB", 4) * 1024 * 1024 * 1024
+    Memory.cacheLimit = cacheGB
+    Memory.clearCache()
+}
 
 public enum SeedlessTier {
     case auto
