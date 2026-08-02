@@ -658,6 +658,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                    restoreLen >= PrefixPersist.stableMinTokens, restoreLen <= lcp {
                     let toks = Array(content[0 ..< restoreLen])
                     if !PrefixPersist.has(modelDir: self.modelDir, tokens: toks),
+                       HostMemory.canAllocate(3.0),      // OMLX-style memory guard: skip when the machine is OOM-tight
                        let blob = backend.persistentState?() {
                         let model = self.modelDir
                         DispatchQueue.global(qos: .utility).async {
@@ -694,6 +695,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 // The state is exactly at the boundary here (gen-suffix prefill comes next);
                 // persistentState() is a CPU copy of shared buffers, the file write is async.
                 if self.prefixRAM.budget > 0 || PrefixPersist.enabled,
+                   HostMemory.canAllocate(3.0),   // OMLX-style memory guard: persistentState() copies GBs on the main thread
                    let blob = backend.persistentState?() {
                     // #117: RAM tier keeps this conversation warm across arena-path switches.
                     if self.prefixRAM.budget > 0 { self.prefixRAM.save(tokens: content, state: blob) }
@@ -703,6 +705,9 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                             PrefixPersist.save(modelDir: model, tokens: content, state: blob)
                         }
                     }
+                } else if (self.prefixRAM.budget > 0 || PrefixPersist.enabled) && !HostMemory.canAllocate(3.0) {
+                    FileHandle.standardError.write(Data(
+                        "[qwisp] memory guard: skipping prefix persist save (\(HostMemory.summary()) too tight)\n".utf8))
                 }
 
                 // Prefill the generation-prompt suffix + decode. prefillTokens = suffix (arena already
