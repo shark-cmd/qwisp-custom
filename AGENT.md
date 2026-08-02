@@ -206,3 +206,69 @@ verdict, flag-off default is byte-identical anyway).
 - **Re-prefill latency.** Each compacting event re-prefills the retained context (~28.6K tokens ≈ 70–135s on a 35B model). This replaces the old double-prefill cost; the retained context is prefilled exactly once.
 - **Prefix cache invalidated on compact.** All cross-turn prefix snapshots are cleared. The first turn after compacting pays a full prefill cost; subsequent turns rebuild the cache normally.
 - **Thinking tokens.** Qwen3 emits `reasoning_content` before `content`. Many clients ignore `reasoning_content`. Use `max_tokens >= 500` or `enable_thinking: false` to get the final answer token.
+
+---
+
+# OMLX efficiency stack — notes & qwisp port plan (2026-08-02)
+
+Source studied: `/Applications/oMLX.app/Contents/Resources/omlx/` + embedded
+`dflash_mlx`, `mlx_vlm/turboquant.py`, `mlx_lm` (Python/MLX). OMLX runs the
+SAME model family (Qwen3.6-35B-A3B) on this same Mac, port 7866, and is
+actively used (117K-token requests). Its server holds 20.6GB RSS — qwisp
+MUST coexist with it on 64GB (this is what OOM-killed qwisp on 2026-08-02;
+fixed by the HostMemory guard, see commits).
+
+## What OMLX does (settings.json / model_profiles.json / source)
+
+| Technique | OMLX config | What it does | qwisp status |
+|---|---|---|---|
+| **SpecPrefill** (draft-guided sparse MoE prefill) | `specprefill_enabled=true, draft=DFlash, threshold=8192, keep_pct=0.1–0.2` | DFlash (6-layer, 737MB) prefills the prompt + 8 lookahead decodes; importance = pooled softmax(Q_lookahead·K_promptᵀ/√d) max over layers×heads; top 10–20% of conversation tokens get full target compute, the rest SKIP experts (KV holes at real RoPE positions, `_OffsetAdjustedRoPE` patches decode) | NOT IMPLEMENTED — the 5–10x prefill win (cold 52K ≈ 290s → ~60–90s; new-conversation delta prefill also slashed) |
+| **DFlash block-diffusion spec decode** | `dflash_enabled` + `dflash_mlx` engine | Draft predicts 16-token blocks in one diffusion pass; target verifies; AdaptiveBlockPolicy shrinks block on low acceptance; draft KV = sink 64 + window 1024 | qwisp has SuffixSpec (N-gram, 3–5% accept — useless at 52K); DFlash replaces the draft |
+| **TurboQuant KV cache** | `turboquant_kv_bits=2/4/8`, MSE codec + RHT rotation, fused quant kernel, keys=floor(bits) values=ceil(bits) | 4x smaller KV → decode at long context is KV-memory-bound; also 4x smaller disk states | NOT IMPLEMENTED (fp16 KV). Our decode window (QWISP_DECODE_WINDOW=16384, commit 7ad6ae4) already caps decode attention reads, same decode win WITHOUT lossiness; KV quant additionally shrinks PrefixPersist files 4x (1.9GB → 500MB) |
+| **SSD/hot KV cache** | 120GB SSD + 10GB hot, paged block tables, LRU | Cross-process prefix reuse at scale; stats show 83M/90M tokens cached (92% hit) over 1021 requests | PrefixPersist (stable tier default-on; #89 tier `QWISP_PREFIX_PERSIST=1`; caps now 4096MB/8192MB). VERIFIED 2026-08-02: restart → same 14K request 83.1s → 7.4s (restore, prefill=4 tok/s) |
+| **Memory guards** | `prefill_memory_guard=true, soft=0.85, hard=0.95, safe_zone=0.8, min_chunk=32` | Refuses/degrades when the WHOLE MACHINE (not just MLX) is OOM-tight | **ADOPTED** (commit 3c00cb1): `HostMemory.freeGB()` (host_statistics64 free+inactive), gates both persist save sites on `canAllocate(3.0)`. OOM root cause: omlx(20.6GB)+Docker(3.1GB)+qwisp(25.7GB)+1.2GB blob copy → killed |
+| **GDN chunked/blocked-sequential Metal kernels** | `custom_kernels/qwen35_prefill/gdn.py` (chunked-parallel WY, blocked-seq S) | Gated DeltaNet prefill ~half the FLOPs of sequential recurrence, staged in 4K-token segments | qwisp already models GDN (persistentStateData carries GDN states); kernel-level optimization is deep Metal work, deferred |
+| **qwen35 fused MoE kernels** | `qwen35_moe_weighted_sum` + NAX (M5 tensor-unit) dispatch detect | Fused expert-weighting reduction | Not ported (qwisp's own MoE path is MLX; NAX is M5-only — we're M1 Max) |
+| **Chunked prefill** | `chunked_prefill=true, step=2048` | Chunked prefill with memory-aware chunking | qwisp hybrid prefill already chunks (min(1024,maxM)); OMLX's memory-guarded chunk sizing is the missing piece |
+| **Burst decode** | `burst_decode_mode=balanced` | Decode-ahead scheduling | Not ported |
+
+## Port plan (priority order, impact × feasibility)
+
+1. **DFlash speculative DECODE** (replaces SuffixSpec 3% accept → 60%+): load the
+   6-layer DFlash draft (config: block_size=16, mask_token_id=248077, target
+   layer ids 1,6,11,16,22,27,32,37, 5×sliding+1×full attn, head_dim=128,
+   hidden 2048/6144, 32 heads/8 KV) + block-diffusion denoising loop in
+   Swift/MLX; feed drafted blocks into the existing SeedlessFusedVerify path.
+   Decode floor is ~80 tok/s fixed; at 52K ctx (21→39 tok/s windowed) spec
+   decode could reach 60–100+ tok/s. ALSO enables SpecPrefill scoring.
+2. **SpecPrefill sparse prefill**: draft scores importance → target prefills
+   only top 10–20% of NEW-conversation tokens (system prefix stays dense).
+   The 52K cold-start killer (290s → ~60–90s). Needs: draft prefill fwd,
+   Q·K importance kernel, sparse attention mask + per-token MoE routing mask,
+   RoPE position-map + offset patch, correctness gate (PREFIXE2E-style).
+3. **TurboQuant KV**: quantize KV on write (per-head-vector norms + packed
+   midpoints, MSE codec), dequant inline in the sdpa kernel read path;
+   shrinks disk states 4x (faster restores, fits default caps) and arena
+   footprint; could relax/disable the decode window (lossless attention).
+4. **OMLX-scale SSD cache**: PrefixPersist already covers this; extend with
+   block-granular spans (save only changed suffix) to cut the 1.9GB full
+   rewrite per Hermes turn.
+5. **Memory-guarded prefill chunking** (OMLX min_chunk/safe-zone): scale the
+   hybrid prefill chunk by free RAM when the machine is tight.
+
+## Key numbers from OMLX stats (this Mac, 64GB, M1 Max)
+
+- mlx-community Qwen3.6-35B-A3B-4bit: 51.1M prompt tokens / 24.2K s ≈ 2114 tok/s
+  avg (includes SSD-cache restores + specprefill sparsity; dense ceiling for
+  3B-active ≈ 1.6K tok/s → OMLX EXCEEDS it via sparse prefill)
+- Ornith-1.0-35B-6bit: 2372 tok/s avg; 92% cache-hit rate
+- MTPLX model (ours): tried once, 346 tok/s (no cache, no specprefill)
+- Decode: 117K-token prompt → 0.8 tok/s (OMLX, no KV quant at that load);
+  ours at 52K with decode window: 39 tok/s — already ahead at long context
+
+## What OMLX does NOT do for us
+
+- The 20.6GB resident server competes with qwisp for RAM (hence the memory
+  guard). Its DFlash/specprefill machinery is Python+MLX; porting the
+  ALGORITHMS (not kernels) to Swift/MLX is the strategy. mlx-swift exposes
+  the same ops (mlx.fast.metal_kernel, etc.) so GDN/kernels are portable.
