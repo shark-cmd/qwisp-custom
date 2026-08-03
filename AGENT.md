@@ -241,6 +241,20 @@ fixed by the HostMemory guard, see commits).
    Swift/MLX; feed drafted blocks into the existing SeedlessFusedVerify path.
    Decode floor is ~80 tok/s fixed; at 52K ctx (21→39 tok/s windowed) spec
    decode could reach 60–100+ tok/s. ALSO enables SpecPrefill scoring.
+   **PORTED + VERIFIED (2026-08)**: pure-MLX draft forward (fc→hidden→6×
+   layers→norm→lm_head) matches dflash_mlx bit-for-bit on synthetic LCG
+   inputs and reproduces the reference argmax on qwisp's real captured
+   features. Capture: 0-based layers [1,6,11,16,22,27,32,37] (OMLX adds +1
+   to the 1-based target_layer_ids). MEASURED on the INT4 MTPLX target:
+   acceptance 20–38% (15-token prompt 33–38%; 5.8K ctx 21%; 12.5K 20% —
+   plateaus, the 4-bit target's hiddens diverge from the draft's bf16
+   teacher). tok/step 4.0–6.7, verify amortizes ~2x at M=17 (157ms vs 378ms
+   sequential at 12.5K) but draft KV rebuild is 123–146ms/step at T=1024
+   (fc over the whole window). NET: 13–24 tok/s vs 40–72 tok/s fused baseline
+   → net-negative on this model; matches OMLX's own dflash_enabled:false.
+   The draft KV cache (incremental dctx/k/v projection) would cut the draft
+   to ~10ms but acceptance must reach ~50% for parity — INT4 caps it below.
+   Keep for bf16 targets / SpecPrefill scoring; OFF by default here.
 2. **SpecPrefill sparse prefill**: draft scores importance → target prefills
    only top 10–20% of NEW-conversation tokens (system prefix stays dense).
    The 52K cold-start killer (290s → ~60–90s). Needs: draft prefill fwd,
