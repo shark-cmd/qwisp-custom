@@ -194,6 +194,40 @@ case "dflash-check":
     // DFlash draft forward synthetic check (compare vs reference dflash_mlx/model.py)
     let ddir = args.count > 1 ? args[1] : "/Users/apple/.omlx/models/z-lab/Qwen3.6-35B-A3B-DFlash"
     print(DFlashCheck.run(draftDir: ddir))
+case "dflash-score":
+    // SpecPrefill token-importance scoring: qwisp dflash-score [draftDir] [modelDir] [promptFile]
+    let ddir = args.count > 1 ? args[1] : "/Users/apple/.omlx/models/z-lab/Qwen3.6-35B-A3B-DFlash"
+    let mdir = args.count > 2 ? args[2] : "/Users/apple/Documents/huggingface/models/Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16"
+    let pfile = args.count > 3 ? args[3] : "/tmp/specprefill_prompt.txt"
+    guard let txt = try? String(contentsOfFile: pfile, encoding: .utf8) else {
+        print("specprefill: cannot read prompt file \(pfile)"); exit(1)
+    }
+    let store = try WeightStore(modelDir: mdir)
+    store.residentAll()
+    let engine = SeedlessEngine.build(store: store)
+    guard let draft = DFlashDraftModel.load(draftDir: ddir) else {
+        print("specprefill: draft load failed \(ddir)"); exit(1)
+    }
+    let tok = try await QwispTokenizer(modelDir: mdir)
+    let toks = tok.encode(txt).map(Int32.init)
+    print("specprefill: scoring \(toks.count) tokens")
+    let t0 = DispatchTime.now()
+    guard let sel = SpecPrefill.score(tokens: toks, draft: draft, engine: engine) else {
+        print("specprefill: scoring failed"); exit(1)
+    }
+    let ms = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e6
+    print("specprefill: selected \(sel.count)/\(toks.count) (\(String(format: "%.0f", Float(sel.count) / Float(toks.count) * 100))%) in \(String(format: "%.1f", ms))ms")
+    // selected token spans, for a quick sanity peek
+    var spans: [(Int, Int)] = []
+    var last = -2
+    for s in sel {
+        let si = Int(s)
+        if si != last + 1 { spans.append((si, si)) } else { spans[spans.count - 1].1 = si }
+        last = si
+    }
+    print("spans: \(spans.count) contiguous runs")
+    for sp in spans.prefix(12) { print("  [\(sp.0)...\(sp.1)] \(tok.decode(Array(toks[sp.0...sp.1]).map(Int.init)).prefix(60))") }
+    exit(0)
 case "simulate":
     // qwisp simulate <N>gb [--gpu-gb X] [--ram-gb Y] — small-RAM Mac emulation (issue #71)
     exit(Simulate.run(args: Array(args.dropFirst())))
