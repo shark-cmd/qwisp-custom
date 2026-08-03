@@ -190,6 +190,10 @@ case "gpusampletest":
     let (passed, total, log) = SamplerGPU.distributionSelfCheck()   // GPU kernel vs analytic softmax (no model)
     print(log.joined(separator: "\n") + "\nGPUSAMPLETEST \(passed)/\(total)")
     if passed != total { exit(1) }
+case "dflash-check":
+    // DFlash draft forward synthetic check (compare vs reference dflash_mlx/model.py)
+    let ddir = args.count > 1 ? args[1] : "/Users/apple/.omlx/models/z-lab/Qwen3.6-35B-A3B-DFlash"
+    print(DFlashCheck.run(draftDir: ddir))
 case "simulate":
     // qwisp simulate <N>gb [--gpu-gb X] [--ram-gb Y] — small-RAM Mac emulation (issue #71)
     exit(Simulate.run(args: Array(args.dropFirst())))

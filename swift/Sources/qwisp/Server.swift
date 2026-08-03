@@ -134,6 +134,10 @@ final class QwispEngine: @unchecked Sendable {
         let pfRate = pf.secs > 0 ? String(format: "%.0f", Double(pf.tok) / pf.secs) : "-"
         fputs(String(format: "[qwisp] %@ prompt=%d prefill=%@ tok/s gen=%d ttft=%@ decode=%.1f tok/s (%.2fs) spec[steps=%d tok/step=%.2f accept=%.0f%% d0=%d rej=%d alt=%d]\n",
                      tag, prompt, pfRate, gen, ttft, rate, now.timeIntervalSince(t0), st.steps, tokPerStep, acc, st.d0, st.rejects, st.altHits), stderr)
+        if !Tell.dflashRejectLog.isEmpty {
+            fputs("[dflash-margin] " + Tell.dflashRejectLog.joined(separator: " | ") + "\n", stderr)
+            Tell.dflashRejectLog = []
+        }
     }
 
     /// Non-streaming completion.

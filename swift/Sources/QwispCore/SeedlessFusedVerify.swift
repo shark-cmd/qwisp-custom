@@ -3289,6 +3289,11 @@ public enum SeedlessFusedVerify {
         /// bolt calib: strict モードで層毎の routing(expert id)を観測する(readback は既に行われる=無料)。
         /// (layerIndex, inds[M*Ktop]) — nil の間は呼び出しコスト無し。
         public var indsCaptureHook: ((Int, [Int32]) -> Void)? = nil
+        /// DFlash block-diffusion draft capture: 8 対象層の resid 後 hBuf を readback する。
+        /// nil の間はループ内の is-check のみ(ゼロコスト)。
+        public var dflashCtx: DFlashContext? = nil
+        /// DFlash hybrid-prefill capture: per-target-layer blit snapshot buffers (M×H fp16).
+        private var dflashCaptureBufs: [MTLBuffer] = []
 
         public init?(layers specs: [SeedlessVerifyForward.LayerSpec], caches: [SeedlessVerifyForward.LayerCaches],
                      maxM: Int, H: Int, maxSeqLen: Int,
@@ -3647,6 +3652,14 @@ public enum SeedlessFusedVerify {
                     SeedlessFusedVerify.encodeMoERouteRows(curEnc!, x: postNorm, w: layers[li + 1].moe, sc: moeSc,
                                                       M: M, E: layers[li + 1].E, H: H, Ktop: layers[li + 1].Ktop)
                     flushCB()
+                    // DFlash capture: flush 後も hBuf = 層 li の resid 出力のまま(次層 pre-MoE は
+                    // hBuf を読むだけで書かない)。readback → dflashCtx.readback[li] = [M, H] fp16。
+                    if let dc = dflashCtx, dc.captureEnabled, DFlashContext.captureTargets.contains(li) {
+                        let n = M * H
+                        let ptr = hBuf.contents().bindMemory(to: Float16.self, capacity: n)
+                        let arr = Array(UnsafeBufferPointer(start: ptr, count: n))
+                        dc.readback[li] = MLXArray(arr, [M, H])
+                    }
                 }
                 // else: 最終層 → enc を開けたまま finalCBExtra に渡す
             }
@@ -3757,13 +3770,44 @@ public enum SeedlessFusedVerify {
 
             switch streamMode {
             case .resident:
-                let cb = queue.makeCommandBuffer()!
-                let enc = cb.makeComputeCommandEncoder()!
-                encodeEmbed(enc)
-                for (li, L) in layers.enumerated() { encodeLayer(enc, L, li: li, M: M) }
-                encodeFinalOps(enc)
-                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
-                SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+                if let dc = dflashCtx, dc.captureEnabled {
+                    // DFlash capture variant: the resident 1-CB path can't read per-layer hiddens,
+                    // so when the draft window wants them, flush at each capture layer and read
+                    // hBuf on the CPU (M ≤ 17 → the extra flushes are ~1ms; capture-only cost).
+                    var cb: MTLCommandBuffer? = nil
+                    var enc: MTLComputeCommandEncoder? = nil
+                    func curEnc() -> MTLComputeCommandEncoder {
+                        if enc == nil { cb = queue.makeCommandBuffer()!; enc = cb!.makeComputeCommandEncoder()! }
+                        return enc!
+                    }
+                    func curFlush() {
+                        guard let c = cb else { return }
+                        enc!.endEncoding()
+                        c.commit(); c.waitUntilCompleted()
+                        enc = nil; cb = nil
+                    }
+                    encodeEmbed(curEnc())
+                    for (li, L) in layers.enumerated() {
+                        encodeLayer(curEnc(), L, li: li, M: M)
+                        if DFlashContext.captureTargets.contains(li) {
+                            curFlush()
+                            let n = M * H
+                            let ptr = hBuf.contents().bindMemory(to: Float16.self, capacity: n)
+                            let arr = Array(UnsafeBufferPointer(start: ptr, count: n))
+                            dc.readback[li] = MLXArray(arr, [M, H])
+                        }
+                    }
+                    encodeFinalOps(curEnc())
+                    curFlush()
+                } else {
+                    let cb = queue.makeCommandBuffer()!
+                    let enc = cb.makeComputeCommandEncoder()!
+                    encodeEmbed(enc)
+                    for (li, L) in layers.enumerated() { encodeLayer(enc, L, li: li, M: M) }
+                    encodeFinalOps(enc)
+                    enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                    SeedlessFusedForward.profLastGPUMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000.0
+                }
 
             case .bolt:
                 let cb = queue.makeCommandBuffer()!
@@ -4100,6 +4144,36 @@ public enum SeedlessFusedVerify {
                 curEnc!.endEncoding(); cb.commit(); cb.waitUntilCompleted()
                 curEnc = nil; curCB = nil
             }
+            // DFlash hybrid-prefill capture: blit hBuf → per-target-layer snapshot right after
+            // the layer's resid add (same CB ordering → snapshot = the layer output). Readback
+            // deferred to the end (after the final flush). Cost only when dflashCtx set + enabled.
+            func dflashCapture(_ li: Int, M: Int) {
+                guard let dc = dflashCtx, dc.captureEnabled, DFlashContext.captureTargets.contains(li),
+                      let i = DFlashContext.captureTargets.firstIndex(of: li) else { return }
+                while dflashCaptureBufs.count <= i {
+                    dflashCaptureBufs.append(device.makeBuffer(length: maxM * H * 2, options: .storageModeShared)!)
+                }
+                if let ce = curEnc { ce.endEncoding(); curEnc = nil }
+                if curCB == nil { curCB = queue.makeCommandBuffer()! }
+                let be = curCB!.makeBlitCommandEncoder()!
+                be.copy(from: hBuf, sourceOffset: 0, to: dflashCaptureBufs[i], destinationOffset: 0, size: M * H * 2)
+                be.endEncoding()
+                // CRITICAL: commit the CB carrying the layer's resid-add + the blit NOW, or the
+                // next enc() replaces curCB and the GPU never runs either (capture read zeros).
+                // curEnc is already ended here, so commit curCB directly (outer flush() would
+                // force-unwrap the now-nil curEnc).
+                if let c = curCB { c.commit(); c.waitUntilCompleted() }
+                curCB = nil
+            }
+            func dflashReadback(_ M: Int) {
+                guard let dc = dflashCtx, dc.captureEnabled else { return }
+                for (i, li) in DFlashContext.captureTargets.enumerated() where i < dflashCaptureBufs.count {
+                    let n = M * H
+                    let ptr = dflashCaptureBufs[i].contents().bindMemory(to: Float16.self, capacity: n)
+                    let arr = Array(UnsafeBufferPointer(start: ptr, count: n))
+                    dc.readback[li] = MLXArray(arr, [M, H])
+                }
+            }
             let keyDim = numKHeads * headKDim, valueDim = numVHeads * headVDim
             let convDim = keyDim * 2 + valueDim
             for (li, L) in layers.enumerated() {
@@ -4166,16 +4240,19 @@ public enum SeedlessFusedVerify {
                     SeedlessFusedVerify.encodeMoESharedRows(enc(), x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
                                                        M: M, I: L.I, H: H, Ktop: L.Ktop)
                     SeedlessFusedVerify.encodeResidAdd(enc(), h: hBuf, r: moeOut, total: M * H)
+                    dflashCapture(li, M: M)
                 } else {
                     SeedlessFusedVerify.encodeMoEBlockRows(enc(), x: postNorm, out: moeOut, w: L.moe, sc: moeSc,
                                                       M: M, E: L.E, I: L.I, Ktop: L.Ktop, H: H)
                     SeedlessFusedVerify.encodeResidAdd(enc(), h: hBuf, r: moeOut, total: M * H)
+                    dflashCapture(li, M: M)
                 }
             }
             if let fw = finalNormW {
                 SeedlessFusedVerify.encodeRmsNormRows(enc(), x: hBuf, w: fw, out: normed, rows: M, D: H, eps: eps)
             }
             flush()
+            dflashReadback(M)   // DFlash: read the per-layer snapshots (blits completed with this flush)
             let src = finalNormW != nil ? normed : hBuf
             let ptr = src.contents().bindMemory(to: Float16.self, capacity: maxM * H)
             return MLXArray(Array(UnsafeBufferPointer(start: ptr, count: M * H)), [M, H])

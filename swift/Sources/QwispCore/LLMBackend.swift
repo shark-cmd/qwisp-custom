@@ -138,6 +138,8 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
     let tier: SeedlessTier
     let contextLen: Int      // model context window (max_position_embeddings); caps unbounded generation.
     let isStreamingTier: Bool // tier resolved once at init (prompt-length independent)
+    /// DFlash block-diffusion draft session (QWISP_DFLASH=1). nil = disabled.
+    public private(set) var dflashSession: DFlashSession? = nil
 
     // ── Cross-request prefix cache (default ON; QWISP_PREFIX_CACHE=0 opts out) ──────────
     // Persistent per-instance backend (fused on resident; strict streaming since #76) + a
@@ -242,6 +244,18 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
         self.cachedPrefixMaxSlots = Swift.max(2, Tell.envInt("QWISP_PREFIX_MAX_SLOTS", 6))
         self.cachedPrefixRAMBudget = Swift.max(0, Tell.envInt("QWISP_PREFIX_RAM_MB", isStreamingTier ? 0 : 2048)) * 1_048_576
         self.cachedPrefixStreaming = cachedLossless && Tell.envInt("QWISP_PREFIX_STREAMING", 1) != 0
+        // DFlash block-diffusion draft (opt-in): QWISP_DFLASH=1 + QWISP_DFLASH_DIR.
+        // 737MB BF16 draft — load only when enabled AND the machine has room (OMLX-style
+        // whole-machine guard; omlx-server + Docker co-tenancy is the norm here).
+        if ProcessInfo.processInfo.environment["QWISP_DFLASH"] == "1",
+           let dir = ProcessInfo.processInfo.environment["QWISP_DFLASH_DIR"],
+           HostMemory.canAllocate(1.0),
+           let m = DFlashDraftModel.load(draftDir: dir) {
+            self.dflashSession = DFlashSession(model: m)
+            FileHandle.standardError.write(Data("[qwisp] DFlash draft loaded: \(dir)\n".utf8))
+        } else if ProcessInfo.processInfo.environment["QWISP_DFLASH"] == "1" {
+            FileHandle.standardError.write(Data("[qwisp] DFlash: enabled but not loaded (dir/env or memory guard)\n".utf8))
+        }
     }
 
     public func generate(_ prompt: [Int], options: GenerateOptions) -> AsyncStream<Int> {
@@ -439,11 +453,16 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     }
                     let sb: Tell.SpecBackend? = cfg.isStreaming
                         ? Tell.streamingBackend(engine: self.engine, modelDir: self.modelDir,
-                                                maxM: cfg.maxM, maxSeqLen: maxSeqLen, C: strictC).map { $0.0 }
+                                                maxM: cfg.maxM, maxSeqLen: maxSeqLen, C: strictC).map { pair in
+                            // DFlash capture hook needs the window ctx on the fused forward.
+                            if let session = self.dflashSession { pair.1.dflashCtx = session.ctx }
+                            return pair.0
+                        }
                         : Tell.fusedBackend(
                             engine: self.engine,
                             maxM: hybridPrefillEnabled ? Swift.max(cfg.maxM, 1032) : cfg.maxM,
-                            maxSeqLen: maxSeqLen)
+                            maxSeqLen: maxSeqLen,
+                            dflash: self.dflashSession?.ctx)
                     guard let backend = sb else { break }
                     // Each segment dispatches to greedy or sampling. Sampling keeps its own state
                     // per segment (RNG restarts, so vary the seed by `produced` to avoid reusing the
@@ -479,7 +498,8 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                                                toks: toks, outPath: outP)
                     } else {
                         seg = Tell.runSpecLoop(promptIds: seq, backend: backend, engine: self.engine,
-                                               N: segN, maxK: strictMaxK, isCancelled: { cancel.isCancelled }, onToken: onTok)
+                                               N: segN, maxK: strictMaxK, dflash: self.dflashSession,
+                                               isCancelled: { cancel.isCancelled }, onToken: onTok)
                     }
                     guard let seg, !seg.isEmpty else { break }
                     // Greedy strict flows through the guard (unified seq/produced + re-arm);
@@ -555,17 +575,19 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                         // #76 strict streaming: budget-fit C (#69) + persistent expert arena —
                         // existingProviders survive KV-arena growth rebuilds.
                         let strictC = DeviceCalibration.strictStreamingC(tierC: cfg.c)
-                        if let (sb, _, provs) = Tell.streamingBackend(
+                        if let (sb, fwd, provs) = Tell.streamingBackend(
                             engine: self.engine, modelDir: self.modelDir,
                             maxM: cfg.maxM, maxSeqLen: newLen, C: strictC,
                             existingProviders: self.prefixProviders) {
+                            if let session = self.dflashSession { fwd.dflashCtx = session.ctx }
                             self.prefixProviders = provs
                             built = sb
                         } else { built = nil }
                     } else {
                         // Steel-prefill hybrid wants chunk=1024 → bump maxM (scratch ~200MB, resident tier).
                         let mm = hybridPrefillEnabled ? Swift.max(cfg.maxM, 1032) : cfg.maxM
-                        built = Tell.fusedBackend(engine: self.engine, maxM: mm, maxSeqLen: newLen)
+                        built = Tell.fusedBackend(engine: self.engine, maxM: mm, maxSeqLen: newLen,
+                                                   dflash: self.dflashSession?.ctx)
                     }
                     guard let b = built else {
                         continuation.finish(); return
@@ -573,6 +595,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     self.prefixBackend = b; self.prefixArenaLen = newLen
                     self.prefixEmptySnap = b.fullSnapshot?()
                     self.prefixSlots = []; self.arenaContent = []   // new arena → old snapshots invalid
+                    self.dflashSession?.ctx.reset()                 // fresh KV → draft window stale
                 }
                 let backend = self.prefixBackend!
                 let full = prompt.map { Int32($0) }
@@ -646,6 +669,12 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                     backend.fullRestore?(e)
                 }
                 self.prefixSlots.removeAll { $0.len > Swift.max(lcp, restoreLen) }
+                // DFlash window: a restore below the window's tail (or a compaction reset)
+                // means the window rows' RoPE positions are no longer in the KV — reset; the
+                // draft context rebuilds from the delta prefill tail + verify rows.
+                if let ds = self.dflashSession, restoreLen < ds.ctx.count {
+                    ds.ctx.reset()
+                }
                 // #112 stable-prefix persist: divergence from the arena path (= a NEW
                 // conversation) that still shares a ≥stableMinTokens restore point is
                 // recurrence evidence — the shared block is the harness system+tools
@@ -681,7 +710,8 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                         return
                     }
                     let end = Swift.min(pos - (pos % self.prefixSnapStride) + self.prefixSnapStride, content.count)
-                    _ = Tell.prefill(promptIds: Array(content[pos ..< end]), backend: backend)
+                    _ = Tell.prefill(promptIds: Array(content[pos ..< end]), backend: backend,
+                                     dflash: self.dflashSession?.ctx)
                     if let snap = backend.fullSnapshot?() { self.prefixSlots.append((len: end, snap: snap)) }
                     pos = end
                 }
@@ -721,6 +751,7 @@ public final class SeedlessBackend: LLMBackend, @unchecked Sendable {
                 let hist = compacted ? (content + genSuffix) : full
                 _ = Tell.runSpecLoop(promptIds: hist, backend: backend, engine: self.engine,
                                      N: genBudget, maxK: maxK, prefillTokens: genSuffix,
+                                     dflash: self.dflashSession,
                                      isCancelled: { cancel.isCancelled },
                                      onToken: { continuation.yield($0) })
                 continuation.finish()

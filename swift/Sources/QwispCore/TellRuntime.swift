@@ -149,15 +149,18 @@ extension Tell {
 
     /// fused backend(1-CB step: embed→40層→final norm→lm_head→argmax、readback は token id のみ。
     /// rollback は KV len 巻き戻し+ping-pong swap)。
-    static func fusedBackend(engine: SeedlessEngine, maxM: Int, maxSeqLen: Int) -> SpecBackend? {
-        return fusedBackendWithFwd(engine: engine, maxM: maxM, maxSeqLen: maxSeqLen)?.0
+    static func fusedBackend(engine: SeedlessEngine, maxM: Int, maxSeqLen: Int,
+                             dflash: DFlashContext? = nil) -> SpecBackend? {
+        return fusedBackendWithFwd(engine: engine, maxM: maxM, maxSeqLen: maxSeqLen, dflash: dflash)?.0
     }
 
     /// fusedBackend + 内部 SeedlessFusedForward の handle も返す変種(MTP-D1 draft が
     /// normedBuffer を GPU-bind するために必要。streamingBackend と同形)。
-    static func fusedBackendWithFwd(engine: SeedlessEngine, maxM: Int, maxSeqLen: Int)
+    static func fusedBackendWithFwd(engine: SeedlessEngine, maxM: Int, maxSeqLen: Int,
+                                     dflash: DFlashContext? = nil)
         -> (SpecBackend, SeedlessFusedVerify.SeedlessFusedForward)? {
         guard let (fwd, fnBuf) = engine.makeFused(maxM: maxM, maxSeqLen: maxSeqLen) else { return nil }
+        fwd.dflashCtx = dflash   // DFlash capture hook (nil → zero-cost)
         let forward: ([Int32]) -> MLXArray? = { tokens in
             let x = engine.embed(tokens: tokens)
             return fwd.forwardRows(x, M: tokens.count, finalNormW: fnBuf)
@@ -224,6 +227,29 @@ extension Tell {
             backend.stepSampleRows = { toks, drafts, invT, seed, base, adj, topP in
                 fwd.stepSampleRows(toks, drafts: drafts, invT: invT, seed: seed, basePos: base, logitAdj: adj, topP: topP)
             }
+        }
+        // DFlash margin measurement (QWISP_DFLASH_MARGIN): CPU-logits trace recording the
+        // top-1−top-2 gap of EVERY verify row (the reject positions read dflashRowMargins).
+        if ProcessInfo.processInfo.environment["QWISP_DFLASH_MARGIN"] != nil,
+           let logitsRows = backend.stepLogitsRows {
+            Tell.dflashMarginTrace = true
+            backend.stepArgmax = { tokens in
+                Tell.dflashRowMargins = []
+                guard let rows = logitsRows(tokens) else { return nil }
+                return rows.map { row in
+                    var best = 0, second = -1
+                    var bestV = -Float.greatestFiniteMagnitude, secondV = -Float.greatestFiniteMagnitude
+                    for t in 0 ..< row.count {
+                        let v = row[t]
+                        if v > bestV { secondV = bestV; second = best; bestV = v; best = t }
+                        else if v > secondV { secondV = v; second = t }
+                    }
+                    Tell.dflashRowMargins.append(second >= 0 ? bestV - secondV : 0)
+                    return best
+                }
+            }
+            backend.chainedStepArgmax = nil
+            FileHandle.standardError.write(Data("[dflash-margin] trace active (fused)\n".utf8))
         }
         backend.kvCaches = fwd.allKVCaches
         return (backend, fwd)
@@ -394,8 +420,15 @@ extension Tell {
         // Margin trace (#47 Part A, QWISP_MARGIN_TRACE): CPU-logits stepArgmax that records the
         // row-0 top-1 − top-2 gap (the argmax_stable_of_margin quantity) into Tell.marginTrace.
         // Chain disabled so every token is measured. Slow (full-vocab readback); measurement only.
-        else if ProcessInfo.processInfo.environment["QWISP_MARGIN_TRACE"] != nil, let logitsRows = backend.stepLogitsRows {
+        // QWISP_DFLASH_MARGIN: same trace, but records the margin of EVERY verify row (the
+        // DFlash reject positions read Tell.dflashRowMargins after the verify).
+        else if ProcessInfo.processInfo.environment["QWISP_MARGIN_TRACE"] != nil
+                || ProcessInfo.processInfo.environment["QWISP_DFLASH_MARGIN"] != nil,
+                let logitsRows = backend.stepLogitsRows {
+            Tell.dflashMarginTrace = ProcessInfo.processInfo.environment["QWISP_DFLASH_MARGIN"] != nil
+            FileHandle.standardError.write(Data("[dflash-margin] trace active\n".utf8))
             let traced: ([Int32]) -> [Int]? = { tokens in
+                if Tell.dflashMarginTrace { Tell.dflashRowMargins = [] }
                 guard let rows = logitsRows(tokens) else { return nil }
                 return rows.enumerated().map { (ri, row) in
                     var best = 0, second = -1
@@ -405,8 +438,9 @@ extension Tell {
                         if v > bestV { secondV = bestV; second = best; bestV = v; best = t }
                         else if v > secondV { secondV = v; second = t }
                     }
+                    let mg = second >= 0 ? bestV - secondV : 0
+                    if Tell.dflashMarginTrace { Tell.dflashRowMargins.append(mg) }
                     if ri == 0 {
-                        let mg = second >= 0 ? bestV - secondV : 0
                         Tell.marginTrace.append(mg); Tell.lastMargin = mg
                         // Distribution shape (#47 probe 14, latent-structure channel): full-vocab
                         // entropy + top-8 (id:logit) per step — feeds the "didn't burn" analysis
@@ -512,7 +546,8 @@ extension Tell {
     /// loop's pre-verify feed once u is known (KV-read draft discipline, notes/17).
     static func prefill(promptIds: [Int32], backend: SpecBackend,
                         mtpHead: SeedlessFusedVerify.SeedlessMTPHead? = nil,
-                        mtpFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil) -> MLXArray? {
+                        mtpFwd: SeedlessFusedVerify.SeedlessFusedForward? = nil,
+                        dflash: DFlashContext? = nil) -> MLXArray? {
         let pLen = promptIds.count
         guard pLen > 0 else { return nil }
         // Steel-prefill hybrid: larger chunks (steel wins grow with M); decode/verify unaffected.
@@ -524,7 +559,16 @@ extension Tell {
         while pos < pLen {
             let end = Swift.min(pos + chunkSize, pLen)
             let chunk = Array(promptIds[pos ..< end])
+            // DFlash capture gate: capture only chunks whose END falls within the last
+            // windowRows tokens (the window trims to the tail anyway). The readback cost
+            // scales with M, so cold 50K+ prefills capture at most the final 1-2 chunks.
+            if let df = dflash {
+                df.captureEnabled = end >= pLen - DFlashContext.windowRows
+            }
             guard let normed = fwdFn(chunk) else { return nil }
+            if let df = dflash, df.captureEnabled {
+                df.appendReadback(rowCount: chunk.count)
+            }
             if let head = mtpHead, let fwd = mtpFwd {
                 // Non-final chunk: k pairs (last row pairs with the next chunk's head
                 // token). Final chunk: k-1 pairs (h_last has no committed successor yet).
@@ -563,6 +607,11 @@ extension Tell {
     // latest row-0 step, set alongside lastMargin (same forward, same alignment contract).
     nonisolated(unsafe) public static var lastEntropy: Float = 0
     nonisolated(unsafe) public static var lastTop8: String = ""
+    // DFlash margin measurement (QWISP_DFLASH_MARGIN=1): per-row top-1−top-2 gaps of the
+    // last verify batch, in order. The reject-point margin is read right after the verify.
+    nonisolated(unsafe) public static var dflashMarginTrace = false
+    nonisolated(unsafe) public static var dflashRowMargins: [Float] = []
+    nonisolated(unsafe) public static var dflashRejectLog: [String] = []
     static let traceAltsEnabled = Tell.envFlag("QWISP_ACCEPT_TRACE")
 
     /// #47 probe 14 — teacher-forced strict replay of a bolt-generated token stream
@@ -594,12 +643,18 @@ extension Tell {
     static func runSpecLoop(promptIds: [Int32], backend: SpecBackend, engine: SeedlessEngine,
                              N: Int, maxK: Int, useA3: Bool = false,
                              prefillTokens: [Int32]? = nil,
+                             dflash: DFlashSession? = nil,
                              isCancelled: (() -> Bool)? = nil,
                              onToken: ((Int) -> Void)? = nil) -> [Int]? {
+        var useA3 = useA3
+        // DFlash block-diffusion drafting is non-A3 only (the A3 pending-batch bookkeeping
+        // and the draft window's append/rollback discipline don't compose cleanly).
+        if dflash != nil { useA3 = false }
         // prefixCache: when the backend's cache already holds a prefix of `promptIds`, pass the
         // remaining suffix as prefillTokens (forward appends it at the cache's current position).
         // `hist` still uses the full promptIds so SuffixSpec drafting is unchanged (speed preserved).
-        guard let lastNormed = prefill(promptIds: prefillTokens ?? promptIds, backend: backend) else { return nil }
+        guard let lastNormed = prefill(promptIds: prefillTokens ?? promptIds, backend: backend,
+                                       dflash: dflash?.ctx) else { return nil }
         guard let lg0 = engine.logits(lastNormed, M: 1) else { return nil }
         MLX.eval([lg0])
         var u = MLX.argMax(lg0[0], axis: -1).item(Int.self)
@@ -616,7 +671,7 @@ extension Tell {
         // greedy stream stays byte-identical while collapsing K CPU round-trips to 1.
         // Strict streaming wires no chain fn (needs a CPU turn per step to ensure/pread
         // the expert union) → nil → per-step fallback by construction. QWISP_CHAIN_K=0 opts out.
-        let chainK = Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault)
+        let chainK = (dflash == nil) ? Tell.envInt("QWISP_CHAIN_K", SeedlessFusedVerify.SeedlessFusedForward.chainKDefault) : 0
         // Incremental streaming seam: onToken nil → zero behavior change (out/return unchanged).
         var streamed = 0
         func flush() { if let onToken { while streamed < out.count { onToken(out[streamed]); streamed += 1 } } }
@@ -641,14 +696,24 @@ extension Tell {
         while out.count < N && !(isCancelled?() ?? false) {
             flush()
             let tD = prof ? Date() : Date.distantPast
-            var drafts = (gateOn && out.count < gateSuspendedUntil) ? []
-                : Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch,
-                                   traceAlts: Tell.traceAltsEnabled)
+            var drafts: [Int] = []
+            if let ds = dflash {
+                // DFlash block-diffusion draft: 15-token block from the target-hidden
+                // conditioned 6-layer draft model. nil (window not ready) → greedy.
+                drafts = ds.model.draftBlock(u: Int32(u), ctx: ds.ctx, engine: engine) ?? []
+            } else {
+                drafts = (gateOn && out.count < gateSuspendedUntil) ? []
+                    : Tell.suffixDraft(hist + [u], maxMatch: 32, draftK: maxK, minMatch: Tell.suffixMinMatch,
+                                       traceAlts: Tell.traceAltsEnabled)
+            }
             if prof { pfDraft += Date().timeIntervalSince(tD) * 1000 }
             let D      = drafts.count
             stSteps += 1; stDrafted += D; if D == 0 { stD0 += 1 }
 
             let snap = backend.snapshot()
+            // DFlash window snapshot (KV snapshot + draft-window snapshot must stay in sync
+            // through the partial-reject rollback below).
+            let snapW = dflash?.ctx.count
 
             if D == 0 {
                 // Chain path (mirrors the bench-engine block in `run`): only the non-A3 /
@@ -680,6 +745,7 @@ extension Tell {
                     guard let evals = backend.stepArgmax([Int32(u)]) else { return nil }
                     if prof { pfVerify += Date().timeIntervalSince(tV) * 1000 }
                     out.append(u); hist.append(u)
+                    dflash?.ctx.appendReadback(rowCount: 1)   // u's hidden → draft window
                     u = evals[0]
                 }
                 continue
@@ -744,6 +810,7 @@ extension Tell {
                 if p == D {
                     out.append(u); hist.append(u)
                     for d in drafts { out.append(d); hist.append(d) }
+                    dflash?.ctx.appendReadback(rowCount: p + 1)   // u + all drafts committed
                     u = evals[D]
                 } else {
                     // Width-2 tree prize probe: would the draft vote's runner-up at the reject
@@ -754,10 +821,17 @@ extension Tell {
                        Tell.lastDraftAlts[p] == evals[p] { stAltHits += 1 }
                     let tR = prof ? Date() : Date.distantPast
                     backend.rollback(snap)
+                    dflash?.ctx.truncate(to: snapW ?? 0)         // window rolls back with the KV
+                    if Tell.dflashMarginTrace, p < Tell.dflashRowMargins.count {
+                        let m = Tell.dflashRowMargins[p]
+                        Tell.dflashRejectLog.append(String(format: "p=%d m=%.4f draft=%d evals=%d", p, m, drafts[p], evals[p]))
+                        if Tell.dflashRejectLog.count > 200 { Tell.dflashRejectLog.removeFirst(Tell.dflashRejectLog.count - 200) }
+                    }
                     out.append(u); hist.append(u)
                     for d in drafts.prefix(p) { out.append(d); hist.append(d) }
                     let rebuildTokens: [Int32] = [Int32(u)] + drafts.prefix(p).map { Int32($0) }
                     guard let _ = backend.forward(rebuildTokens) else { return nil }
+                    dflash?.ctx.appendReadback(rowCount: p + 1)  // re-run committed rows
                     if prof { pfRebuild += Date().timeIntervalSince(tR) * 1000 }
                     u = evals[p]
                 }
