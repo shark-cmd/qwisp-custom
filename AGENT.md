@@ -222,7 +222,7 @@ fixed by the HostMemory guard, see commits).
 
 | Technique | OMLX config | What it does | qwisp status |
 |---|---|---|---|
-| **SpecPrefill** (draft-guided sparse MoE prefill) | `specprefill_enabled=true, draft=DFlash, threshold=8192, keep_pct=0.1–0.2` | DFlash (6-layer, 737MB) prefills the prompt + 8 lookahead decodes; importance = pooled softmax(Q_lookahead·K_promptᵀ/√d) max over layers×heads; top 10–20% of conversation tokens get full target compute, the rest SKIP experts (KV holes at real RoPE positions, `_OffsetAdjustedRoPE` patches decode) | NOT IMPLEMENTED — the 5–10x prefill win (cold 52K ≈ 290s → ~60–90s; new-conversation delta prefill also slashed) |
+| **SpecPrefill** (draft-guided sparse MoE prefill) | `specprefill_enabled=true, draft=DFlash, threshold=8192, keep_pct=0.1–0.2` | DFlash (6-layer, 737MB) prefills the prompt + 8 lookahead decodes; importance = pooled softmax(Q_lookahead·K_promptᵀ/√d) max over layers×heads; top 10–20% of conversation tokens get full target compute, the rest SKIP experts (KV holes at real RoPE positions, `_OffsetAdjustedRoPE` patches decode) | **SCORING PORTED (Phase A, 2026-08-03)**: `SpecPrefill.swift` + `qwisp dflash-score` — draft-as-LM (engine embed, causal self-attn KV, target lm_head) + 8 greedy lookahead + avgpool13 pooled softmax importance + chunk-32 top-keep_pct selection. 1.35K tok/1.6s, 12.5K tok/6.9s (~1800 tok/s). NOTE: OMLX's own specprefill NEVER RUNS on this model family — z-lab draft load fails (rope_theta under rope_parameters not surfaced to ModelArgs, verified in ~/.omlx/logs) — so qwisp exceeds OMLX here. Phase B (sparse target prefill: per-row position table in the Metal sdpa encode + decode position map, `_PositionMappedRoPE`/`_OffsetAdjustedRoPE` equivalent) NOT STARTED — design below. Admission: only conversation tokens > 8192 are scored; the user's Hermes deltas (2–5K) stay below OMLX's default threshold → qwisp should lower it (2048) or make it adaptive |
 | **DFlash block-diffusion spec decode** | `dflash_enabled` + `dflash_mlx` engine | Draft predicts 16-token blocks in one diffusion pass; target verifies; AdaptiveBlockPolicy shrinks block on low acceptance; draft KV = sink 64 + window 1024 | qwisp has SuffixSpec (N-gram, 3–5% accept — useless at 52K); DFlash replaces the draft |
 | **TurboQuant KV cache** | `turboquant_kv_bits=2/4/8`, MSE codec + RHT rotation, fused quant kernel, keys=floor(bits) values=ceil(bits) | 4x smaller KV → decode at long context is KV-memory-bound; also 4x smaller disk states | NOT IMPLEMENTED (fp16 KV). Our decode window (QWISP_DECODE_WINDOW=16384, commit 7ad6ae4) already caps decode attention reads, same decode win WITHOUT lossiness; KV quant additionally shrinks PrefixPersist files 4x (1.9GB → 500MB) |
 | **SSD/hot KV cache** | 120GB SSD + 10GB hot, paged block tables, LRU | Cross-process prefix reuse at scale; stats show 83M/90M tokens cached (92% hit) over 1021 requests | PrefixPersist (stable tier default-on; #89 tier `QWISP_PREFIX_PERSIST=1`; caps now 4096MB/8192MB). VERIFIED 2026-08-02: restart → same 14K request 83.1s → 7.4s (restore, prefill=4 tok/s) |
@@ -257,9 +257,22 @@ fixed by the HostMemory guard, see commits).
    Keep for bf16 targets / SpecPrefill scoring; OFF by default here.
 2. **SpecPrefill sparse prefill**: draft scores importance → target prefills
    only top 10–20% of NEW-conversation tokens (system prefix stays dense).
-   The 52K cold-start killer (290s → ~60–90s). Needs: draft prefill fwd,
-   Q·K importance kernel, sparse attention mask + per-token MoE routing mask,
-   RoPE position-map + offset patch, correctness gate (PREFIXE2E-style).
+   The 52K cold-start killer (290s → ~60–90s).
+   **Phase A DONE (2026-08-03)**: scoring (SpecPrefill.swift, `qwisp
+   dflash-score`) — draft-as-LM + 8 greedy lookahead + avgpool13 pooled
+   softmax importance + chunk-32 top-keep_pct selection; 12.5K tok in 6.9s.
+   **Phase B design (not started)**: the sparse TARGET prefill needs a
+   per-row position table in the Metal sdpa encode. qwisp's sdpa_rows /
+   KV-write kernels derive positions = baseLen + rowIndex; the compressed
+   sparse cache stores N selected rows with REAL RoPE positions, so the
+   kernels must read `posTable[row]` instead (fallback baseLen+row when
+   nil). Decode appends rows with positions baseLen+i via the same table.
+   The full-attn layers (mask .none) need the position-based causal mask
+   (skipped rows are ABSENT from the compressed cache — no empty rows to
+   mask). Prefix-persist/window code assumes contiguous positions — must
+   key off the position map. Admission: OMLX default threshold 8192 excludes
+   the user's 2–5K Hermes deltas — use 2048 or adaptive. Correctness gate:
+   dense vs sparse logits on a shared-prefix pair (PREFIXE2E-style).
 3. **TurboQuant KV**: quantize KV on write (per-head-vector norms + packed
    midpoints, MSE codec), dequant inline in the sdpa kernel read path;
    shrinks disk states 4x (faster restores, fits default caps) and arena
